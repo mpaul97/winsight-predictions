@@ -9,7 +9,6 @@ import pandas as pd
 from pandas import DataFrame
 from pandas.api.typing import DataFrameGroupBy
 
-
 @dataclass
 class FeatureEngine:
 	# --- Core init arguments (former calculate_features parameters) ---
@@ -292,13 +291,16 @@ class FeatureEngine:
 	@property
 	def dependent_stats(self) -> Dict[str, Any]:
 		if self._dependent_stats is None:
-			pg = self.prior_games; tn = self.target_name; preds = self.predicted_features
+			pg = self.prior_games; tn = self.target_name; preds = self.predicted_features; row = self.row
 			d: Dict[str, Any] = {}
 			for dep in self.feature_dependencies.get(tn, []):
-				if preds is not None and dep in preds:
-					d[f'dep_{dep}_for_{tn}'] = preds[dep]
-				else:
-					d[f'dep_{dep}_for_{tn}'] = pg[dep].tail(5).mean() if dep in pg.columns else np.nan
+				if dep in pg.columns:
+					if preds is not None and dep in preds:
+						d[f'dep_{dep}_for_{tn}'] = preds[dep]  # Use predicted value for predictions
+					elif dep in row.index:
+						d[f'dep_{dep}_for_{tn}'] = row[dep]  # Use actual value for training
+					else:
+						d[f'dep_{dep}_for_{tn}'] = pg[dep].mean()  # Use historical average
 			self._dependent_stats = d
 		return self._dependent_stats
 
@@ -308,13 +310,16 @@ class FeatureEngine:
 			if self.target_name != 'fantasy_points':
 				self._fantasy_dependent_stats = {}
 			else:
-				pg = self.prior_games; pos = self.position; preds = self.predicted_features
+				pg = self.prior_games; pos = self.position; preds = self.predicted_features; row = self.row
 				d: Dict[str, Any] = {}
 				for dep in self.fantasy_dependencies.get(pos, []):
-					if preds is not None and dep in preds:
-						d[f'fp_dep_{dep}'] = preds[dep]
-					else:
-						d[f'fp_dep_{dep}'] = pg[dep].tail(5).mean() if dep in pg.columns else np.nan
+					if dep in pg.columns:
+						if preds is not None and dep in preds:
+							d[f'fp_dep_{dep}'] = preds[dep]  # Use predicted value for predictions
+						elif dep in row.index:
+							d[f'fp_dep_{dep}'] = row[dep]  # Use actual value for training
+						else:
+							d[f'fp_dep_{dep}'] = pg[dep].mean()  # Use historical average
 				self._fantasy_dependent_stats = d
 		return self._fantasy_dependent_stats
 
@@ -392,7 +397,11 @@ class FeatureEngine:
 			for stat_type in self.advanced_stat_types.get(pos, []):
 				cols = self.advanced_stat_cols.get(stat_type, [])
 				for col in cols:
-					d[f'adv_{stat_type}_{col}_last5_mean'] = pg[col].tail(5).mean() if col in pg.columns else np.nan
+					col = f"adv_{stat_type}_{col}"
+					d[f'{col}_last3_mean'] = pg[col].tail(3).mean() if col in pg.columns else np.nan
+					d[f'{col}_last5_mean'] = pg[col].tail(5).mean() if col in pg.columns else np.nan
+					d[f'{col}_last10_mean'] = pg[col].tail(10).mean() if col in pg.columns else np.nan
+					d[f'{col}_overall_mean'] = pg[col].mean() if col in pg.columns else np.nan
 			self._advanced_stats_summaries = d
 		return self._advanced_stats_summaries
 
@@ -441,16 +450,12 @@ class FeatureEngine:
 	@property
 	def spread_and_favorite_feature(self) -> Dict[str, Any]:
 		if self._spread_and_favorite_feature is None:
-			row = self.row; abbr = row['abbr']
-			try:
-				if 'winning_name' in row.index and 'losing_name' in row.index:
-					winning_team = row['winning_name']
-					spread = row.get('spread', np.nan)
-					self._spread_and_favorite_feature = {'spread': spread, 'is_favorite': 1 if (abbr == winning_team) else 0}
-				else:
-					self._spread_and_favorite_feature = {'spread': row.get('spread', np.nan), 'is_favorite': row.get('is_favorite', np.nan)}
-			except Exception:
-				self._spread_and_favorite_feature = {'spread': np.nan, 'is_favorite': np.nan}
+			row = self.row
+			if row.get('home_is_favorite') is not None and row.get('is_home') is not None:
+				is_favorite = 1 if (row['home_is_favorite'] == 1 and row['is_home'] == 1) or (row['home_is_favorite'] == 0 and row['is_home'] == 0) else 0
+				self._spread_and_favorite_feature = {'spread': row.get('spread', np.nan), 'is_favorite': is_favorite}
+			else:
+				self._spread_and_favorite_feature = {'spread': row.get('spread', np.nan), 'is_favorite': row.get('is_favorite', np.nan)}
 		return self._spread_and_favorite_feature
 
 	@property
@@ -526,3 +531,46 @@ class FeatureEngine:
 	@property
 	def features(self) -> Dict[str, Any]:
 		return self.load_features()
+
+	@property
+	def grouped_features(self) -> Dict[str, Dict[str, Any]]:
+		"""Group features dynamically for storage or processing."""
+		return {
+			"rolling_stats": self.rolling_target_stats,
+			"dependent_stats": self.dependent_stats,
+			"fantasy_stats": self.fantasy_dependent_stats,
+			"last_game_stats": self.last_game_numeric_stats,
+			"similar_player_stats": self.similar_player_last_game,
+			"epa_features": self.epa_features,
+			"home_away_splits": self.home_away_splits,
+			"team_ranks": self.team_ranks_features,
+			"player_group_ranks": self.player_group_ranks_features,
+			"advanced_stats": self.advanced_stats_summaries,
+			"weather": self.weather_features,
+			"days_rest": self.days_rest_feature,
+			"over_under": self.over_under_feature,
+			"spread_and_favorite": self.spread_and_favorite_feature,
+			"starter_flag": self.starter_flag_feature,
+			"game_targets": self.game_targets_features,
+			"standings": self.standings_features,
+			"big_plays_player": self.big_plays_player_features,
+			"big_plays_opponent": self.big_plays_opponent_features,
+		}
+
+	@property
+	def grouped_features_as_dfs(self) -> Dict[str, pd.DataFrame]:
+		"""Map all grouped features to Dict[str, pd.DataFrame]."""
+		grouped = self.grouped_features
+		result = {}
+
+		for key, value in grouped.items():
+			if isinstance(value, pd.DataFrame):
+				result[key] = value
+			elif isinstance(value, dict):
+				# Convert dictionary to DataFrame
+				result[key] = pd.DataFrame([value])
+			else:
+				# Wrap scalar values or unsupported types in a DataFrame
+				result[key] = pd.DataFrame([{key: value}])
+
+		return result

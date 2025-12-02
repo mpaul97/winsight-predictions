@@ -41,3 +41,10 @@ htmlcov/
 
 # model files
 **/models/
+**/features/
+**/predicted_features/
+
+# data files
+*.csv
+*.json
+*.pkl

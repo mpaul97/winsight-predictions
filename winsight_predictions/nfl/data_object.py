@@ -299,6 +299,15 @@ class DataObject:
             df['abbr'] = df['abbr'].map(TEAM_TO_PLAYER_ABBR_MAPPINGS).fillna(df['abbr'])
             df['opp_abbr'] = df['opp_abbr'].map(TEAM_TO_PLAYER_ABBR_MAPPINGS).fillna(df['opp_abbr'])
             
+            temp_df = df.copy()[df['is_home']==1].rename(columns={'abbr': 'home_abbr', 'opp_abbr': 'away_abbr'})
+            temp_df = self.add_spread_info(temp_df, is_prediction=True)
+
+            df = df.merge(
+                temp_df[['game_id', 'spread', 'home_is_favorite', 'covered_spread', 'mov_of_favorite', 'spread_favorite_abbr']],
+                on='game_id',
+                how='left'
+            )
+
             logging.info(f"Loaded previews from {fn}")
             return df
         except Exception as e:
@@ -476,6 +485,40 @@ class DataObject:
                 stat_cols = data_stat.replace('over_under_', '').split('_&_')
             df[stat] = (df[stat_cols].sum(axis=1) >= value).astype(int)
         return df
+    
+    def get_qb_points(self, row: pd.Series):
+        points = 0
+        # passing_touchdowns
+        points += round(row['passing_touchdowns'], 0)*4
+        # passing_yards
+        points += round(row['passing_yards'], 0)*0.04
+        points += 3 if row['passing_yards'] > 300 else 0
+        # interceptions
+        points -= round(row['interceptions_thrown'], 0)
+        # rush_yards
+        points += round(row['rush_yards'], 0)*0.1
+        points += 3 if row['rush_yards'] > 100 else 0
+        # rush_touchdowns
+        points += round(row['rush_touchdowns'], 0)*6
+        return round(points, 2)
+    
+    def get_skill_points(self, row: pd.Series):
+        points = 0
+        # rush_yards
+        if 'rush_yards' in row.index:
+            points += round(row['rush_yards'], 0)*0.1
+            points += 3 if row['rush_yards'] > 100 else 0
+        # rush_touchdowns
+        if 'rush_touchdowns' in row.index:
+            points += round(row['rush_touchdowns'], 0)*6
+        # receptions
+        points += round(row['receptions'], 0)
+        # receiving_yards
+        points += round(row['receiving_yards'], 0)*0.1
+        points += 3 if row['receiving_yards'] > 100 else 0
+        # receiving_touchdowns
+        points += round(row['receiving_touchdowns'], 0)*6
+        return round(points, 2)
 
     def _load_player_data(self) -> pd.DataFrame:
         """Load complete player data with all necessary merges."""
@@ -507,7 +550,7 @@ class DataObject:
                 how='left'
             )
         # Merge boxscores (use basic boxscores to avoid circular dependency)
-        boxscores_df = self.boxscores.copy()
+        boxscores_df = self.add_spread_info(self.boxscores).copy()
         if not boxscores_df.empty:
             df = df.merge(
                 boxscores_df.drop(columns=['game_date', 'week'], errors='ignore'),
@@ -574,6 +617,25 @@ class DataObject:
         
         # Add DraftKings fantasy targets
         df = self._add_dfk_targets(df)
+
+        # Advanced stats
+        for stat_type in ['passing', 'rushing', 'receiving']:
+            adv_df = self.get_advanced_stats(stat_type)
+            adv_df = adv_df.drop(columns=['game_date', 'player', 'tm'], errors='ignore').rename(columns={
+                col: f"adv_{stat_type}_{col}" for col in adv_df.columns if col not in ['key', 'year', 'pid']
+            })
+            if not adv_df.empty:
+                df = df.merge(
+                    adv_df,
+                    on=['key', 'year', 'pid'],
+                    how='left'
+                )
+
+        # Add fantasy points calculations
+        df['fantasy_points'] = df.apply(
+            lambda row: self.get_qb_points(row) if row.get('pos') == 'QB' else self.get_skill_points(row),
+            axis=1
+        )
 
         df = df.sort_values('game_date')
         logging.info(f"Loaded complete player data: {len(df)} records")
@@ -1512,23 +1574,29 @@ class DataObject:
             import re
             
             # Extract spread value using regex (looks for +/- followed by number)
-            spread_match = re.search(r'([+-]?\d+\.?\d*)', vegas_line_str)
+            spread_match = re.search(r'([+-]?\d+\.?\d*)', vegas_line_str.replace('49ers', ''))
             if spread_match:
                 spread = float(spread_match.group(1))
             else:
                 spread = np.nan
-            
+
             # Determine which team is the favorite
             # The team name appears before the spread in vegas_line
             # Get full team names from mappings and extract last word (team nickname)
             team_full_name = self.team_name_mappings.get(abbr, '')
             opp_full_name = self.team_name_mappings.get(row['away_abbr'], '')
-            
+
             if team_full_name and opp_full_name:
                 # Extract nickname (last word) from full name
                 team_nickname = team_full_name.split()[-1] if isinstance(team_full_name, str) else ''
                 opp_nickname = opp_full_name.split()[-1] if isinstance(opp_full_name, str) else ''
+
+                if team_nickname == '':
+                    raise ValueError(f"Could not extract abbr from team_full_name '{team_full_name}' in DataObject._get_spread_and_favorite")
                 
+                if opp_nickname == '':
+                    raise ValueError(f"Could not extract abbr from opp_full_name '{opp_full_name}' in DataObject._get_spread_and_favorite")
+
                 # Check which team name appears in vegas_line
                 if team_nickname and team_nickname in vegas_line_str:
                     is_favorite = True
@@ -1540,29 +1608,48 @@ class DataObject:
                 is_favorite = np.nan
             return spread, is_favorite
 
-    def add_spread_info(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add spread information to a given DataFrame of games."""
-        # Spread and favorite
+    def add_spread_info(self, df: pd.DataFrame, is_prediction: bool = False) -> pd.DataFrame:
+        """Add spread information to a given DataFrame of games.
+
+        Args:
+            df: DataFrame containing game data.
+            is_prediction: If True, handles preview data for predictions.
+        """
         def func(row: pd.Series) -> pd.Series:
             home_abbr, away_abbr = row['home_abbr'], row['away_abbr']
             try:
                 spread, home_is_favorite = self._get_spread_and_favorite(row, home_abbr)
                 if pd.notna(spread) and pd.notna(home_is_favorite):
-                    if home_is_favorite:
-                        mov_of_favorite = row['home_points'] - row['away_points']
+                    if not is_prediction:
+                        # Training mode: Calculate movement of favorite and spread coverage
+                        if home_is_favorite:
+                            mov_of_favorite = row['home_points'] - row['away_points']
+                        else:
+                            mov_of_favorite = row['away_points'] - row['home_points']
+                        cover_spread = mov_of_favorite > abs(spread)
+                        return pd.Series([
+                            spread,
+                            home_is_favorite,
+                            cover_spread,
+                            mov_of_favorite,
+                            home_abbr if home_is_favorite else away_abbr
+                        ])
                     else:
-                        mov_of_favorite = row['away_points'] - row['home_points']
-                    cover_spread = True if mov_of_favorite > abs(spread) else False
-                return pd.Series([
-                    spread,
-                    home_is_favorite,
-                    cover_spread,
-                    mov_of_favorite,
-                    home_abbr if home_is_favorite else away_abbr
-                ])
+                        # Prediction mode: No movement or coverage calculation
+                        return pd.Series([
+                            spread,
+                            home_is_favorite,
+                            np.nan,  # Placeholder for covered_spread
+                            np.nan,  # Placeholder for mov_of_favorite
+                            home_abbr if home_is_favorite else away_abbr
+                        ])
             except Exception as e:
                 logging.debug(f"Error parsing spread for {row['away_abbr']} vs {row['home_abbr']}, vegas_line='{row.get('vegas_line', '')}': {str(e)}")
-                return pd.Series([np.nan, np.nan])
+                return pd.Series([np.nan, np.nan, np.nan, np.nan, np.nan])
+
+        self.boxscores  # Ensure boxscores data is loaded for team name mappings
+
+        # Apply the function to the DataFrame
         df[[
             'spread', 'home_is_favorite', 'covered_spread', 
             'mov_of_favorite', 'spread_favorite_abbr'
@@ -1943,4 +2030,4 @@ if __name__ == "__main__":
         storage_mode='local',
         local_root='G:/My Drive/python/winsight_api/sports-data-storage-copy/'
     )
-    df = data_obj.player_group_ranks
+    df = data_obj._load_player_data()
