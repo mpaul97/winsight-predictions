@@ -13,11 +13,19 @@ setup(
 	packages=find_packages(include=["winsight_predictions", "winsight_predictions.*"]),
 	include_package_data=True,
 	license="MIT",
-	python_requires=">=3.9",
+	python_requires=">=3.13.2",
 	install_requires=[
 		# Kept in sync with requirements.txt
-		"pandas>=2.0",
-		"numpy>=1.24",
+		"pandas>=2.3.3",
+		"numpy>=2.3.5",
+        "scikit_learn>=1.7.2",
+		"mp_sportsipy>=0.6.0",
+		"boto3>=1.40.54",
+		"joblib>=1.5.2",
+		"python-dotenv>=1.2.1",
+		"regex>=2025.9.1",
+		"setuptools>=72.1.0",
+		"tqdm>=4.67.1",
 	],
 	classifiers=[
 		"Programming Language :: Python :: 3",

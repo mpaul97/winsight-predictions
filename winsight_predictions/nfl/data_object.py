@@ -1,5 +1,6 @@
 import os
 import logging
+import sys
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -18,11 +19,6 @@ except ImportError:
     from const import TEAM_TO_PLAYER_ABBR_MAPPINGS, CONFERENCE_MAPPINGS, DIVISION_MAPPINGS
 
 from mp_sportsipy.nfl.constants import SIMPLE_POSITION_MAPPINGS
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 
 class DataObject:
     """
@@ -90,54 +86,27 @@ class DataObject:
             self.s3_bucket = s3_bucket or os.getenv("SPORTS_DATA_BUCKET_NAME", "")
             if not self.s3_bucket:
                 logging.warning("S3 bucket name not provided or env SPORTS_DATA_BUCKET_NAME missing.")
-            self._s3 = s3_client or boto3.client("s3")
+        self._s3 = s3_client or boto3.client("s3")
 
         # --- Unified helpers ---
-        def _read_csv(path: str, **kwargs) -> pd.DataFrame:
-            if self.storage_mode == "local":
-                return pd.read_csv(path, **kwargs)
-            # S3 path treated as key
-            try:
-                resp = self._s3.get_object(Bucket=self.s3_bucket, Key=path)
-                content = resp["Body"].read().decode("utf-8")
-                return pd.read_csv(StringIO(content), **kwargs)
-            except Exception as e:
-                logging.error(f"Error reading S3 CSV {path}: {e}")
-                return pd.DataFrame()
-
-        def _listdir(prefix_or_path: str) -> List[str]:
-            if self.storage_mode == "local":
-                if not os.path.exists(prefix_or_path):
-                    return []
-                return sorted(os.listdir(prefix_or_path))
-            # S3 listing
-            keys: List[str] = []
-            continuation: Optional[str] = None
-            while True:
-                params = {"Bucket": self.s3_bucket, "Prefix": prefix_or_path}
-                if continuation:
-                    params["ContinuationToken"] = continuation
-                try:
-                    resp = self._s3.list_objects_v2(**params)
-                except Exception as e:
-                    logging.error(f"Error listing S3 prefix {prefix_or_path}: {e}")
-                    break
-                for obj in resp.get("Contents", []):
-                    key = obj["Key"]
-                    if key.endswith("/"):  # skip 'directories'
-                        continue
-                    # Extract filename portion relative to prefix
-                    filename = key[len(prefix_or_path):] if key.startswith(prefix_or_path) else key
-                    if filename:
-                        keys.append(filename)
-                continuation = resp.get("NextContinuationToken")
-                if not continuation:
-                    break
-            return sorted(keys)
-
-        self._read_csv = _read_csv
-        self._listdir = _listdir
         
+        # Data containers (lazy loaded)
+        self._schedules: pd.DataFrame | None = None
+        self._standings: pd.DataFrame | None = None
+        self._previews: pd.DataFrame | None = None
+        self._starters: pd.DataFrame | None = None
+        self._starters_new: pd.DataFrame | None = None
+        self._boxscores: pd.DataFrame | None = None
+        self._player_data: pd.DataFrame | None = None
+        self._player_snaps: pd.DataFrame | None = None
+        self._advanced_stats: Dict[str, pd.DataFrame] = {}
+        self._pbp_features: Dict[str, pd.DataFrame] = {}
+        self._team_ranks: Dict[str, pd.DataFrame] = {}
+        self._player_group_ranks: Dict[str, pd.DataFrame] = {}
+        self._game_predictions: pd.DataFrame | None = None
+        self._next_game_predictions: pd.DataFrame | None = None
+        self._cache: Dict[str, pd.DataFrame] = {}  # General cache for utility methods
+
         # Rank configurations
         self.team_rank_configs = [
             {'mode': 'season', 'split': None},
@@ -191,7 +160,66 @@ class DataObject:
         self.team_name_mappings: Dict[str, str] = {}
         self.player_key_abbr_mappings: Dict[tuple, str] = {}
 
+        self.DIVISION_MAPPINGS = DIVISION_MAPPINGS
+        self.CONFERENCE_MAPPINGS = CONFERENCE_MAPPINGS
+
         logging.info(f"Initialized DataObject for {league.upper()}")
+
+        return
+
+    def _read_csv(self, path: str, **kwargs) -> pd.DataFrame:
+        if self.storage_mode == "local":
+            return pd.read_csv(path, **kwargs)
+        # S3 path treated as key
+        try:
+            resp = self._s3.get_object(Bucket=self.s3_bucket, Key=path)
+            content = resp["Body"].read().decode("utf-8")
+            return pd.read_csv(StringIO(content), **kwargs)
+        except Exception as e:
+            logging.error(f"Error reading S3 CSV {path}: {e}")
+            return pd.DataFrame()
+
+    def _listdir(self, prefix_or_path: str) -> List[str]:
+        if self.storage_mode == "local":
+            if not os.path.exists(prefix_or_path):
+                return []
+            return sorted(os.listdir(prefix_or_path))
+        # S3 listing
+        keys: List[str] = []
+        continuation: Optional[str] = None
+        while True:
+            params = {"Bucket": self.s3_bucket, "Prefix": prefix_or_path}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            try:
+                resp = self._s3.list_objects_v2(**params)
+            except Exception as e:
+                logging.error(f"Error listing S3 prefix {prefix_or_path}: {e}")
+                break
+            for obj in resp.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/"):  # skip 'directories'
+                    continue
+                # Extract filename portion relative to prefix
+                filename = key[len(prefix_or_path):] if key.startswith(prefix_or_path) else key
+                if filename:
+                    keys.append(filename)
+            continuation = resp.get("NextContinuationToken")
+            if not continuation:
+                break
+        return sorted(keys)
+        
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Don't pickle the S3 client, it will be recreated
+        if '_s3' in state and state['_s3'] is not None:
+            state['_s3'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.storage_mode == 's3' and self._s3 is None:
+            self._s3 = boto3.client('s3')
     
     # ====================================================================
     # SCHEDULES
@@ -890,9 +918,8 @@ class DataObject:
         logging.info("Loading game predictions...")
         try:
             # Game predictions typically kept local; allow S3 access if storage_mode == 's3'
-            df = self._read_csv(self.local_game_predictions_dir + "past_nfl_game_predictions.csv")
+            df = self._read_csv(self.local_game_predictions_dir + "all_past_game_predictions.csv")
             logging.info(f"Loaded {len(df)} game prediction records")
-            df.columns = [f"pred_{col}" if col not in ['game_id', 'year', 'home_abbr', 'away_abbr', 'game_date'] else col for col in df.columns]
             df['game_date'] = pd.to_datetime(df['game_date'])
             df = df.sort_values('game_date')
             return df
@@ -910,10 +937,18 @@ class DataObject:
     def _load_next_game_predictions(self) -> pd.DataFrame:
         """Load next game predictions from CSV."""
         logging.info("Loading next game predictions...")
+        if not self.previews.empty:
+            self.previews  # Ensure previews are loaded for team mappings
         try:
-            df = self._read_csv(self.local_game_predictions_dir + "nfl_next_game_predictions.csv")
-            logging.info(f"Loaded {len(df)} next game prediction records")
-            df.columns = [f"pred_{col}" if col not in ['game_id', 'year', 'home_abbr', 'away_abbr', 'game_date'] else col for col in df.columns]
+            week, year = self.previews['week'].mode()[0], self.previews['year'].mode()[0]
+            game_predictions_dir = os.path.join(self.local_game_predictions_dir, f"{year}_week_{week}/")
+            files = self._listdir(game_predictions_dir)
+            if len(files) == 0:
+                logging.warning(f"No next game prediction files found in {game_predictions_dir}")
+                return pd.DataFrame()
+            filename = sorted(files)[-1]  # Get the latest file
+            df = self._read_csv(os.path.join(game_predictions_dir, filename))
+            logging.info(f"Loaded {len(df)} next game prediction records from {filename}")
             df['game_date'] = pd.to_datetime(df['game_date'])
             df = df.sort_values('game_date')
             return df
@@ -935,11 +970,14 @@ class DataObject:
     def _load_player_ratings(self) -> Dict[str, pd.DataFrame]:
         """Load player ratings from CSV."""
         logging.info("Loading player ratings...")
+        if self.boxscores.empty:
+            self.boxscores  # Ensure boxscores are loaded for team mappings
         try:
             _dict = {}
             for fn in self._listdir(self.player_ratings_dir):
                 if fn.endswith(".csv"):
                     temp_df = self._read_csv(f"{self.player_ratings_dir}{fn}")
+                    temp_df = temp_df.merge(self.boxscores[['key', 'year']], on='key', how='left')
                     _dict[fn.split("_")[0]] = temp_df
             logging.info(f"Loaded player rating records")
             return _dict
@@ -976,17 +1014,17 @@ class DataObject:
         
         # Load required data
         starters_df = self.starters.copy()
-        boxscores_df = self.boxscores.copy()
+        boxscores_df = self.boxscores[['key', 'home_abbr', 'away_abbr']].copy()
         player_ratings_dict = self.player_ratings
         
-        # Merge to get home/away abbr
-        starters_df = starters_df.merge(
-            boxscores_df[['key', 'home_abbr', 'away_abbr']], 
-            on='key', 
-            how='left'
-        )
+        if starters_df.empty or not player_ratings_dict:
+            logging.warning("Starters or player_ratings data is empty")
+            return pd.DataFrame()
         
-        # Map positions to simple positions
+        # Merge boxscores once (instead of per group)
+        starters_df = starters_df.merge(boxscores_df, on='key', how='left')
+        
+        # Map positions to simple positions once
         starters_df['pos'] = starters_df['pos'].map(SIMPLE_POSITION_MAPPINGS).fillna(starters_df['pos'])
         
         # Filter by year if specified
@@ -997,53 +1035,49 @@ class DataObject:
         if positions is not None:
             starters_df = starters_df[starters_df['pos'].isin(positions)]
         
-        results = {}
-        
-        # Group by game, position, and home/away status
-        for (key, pos, is_home), group_df in starters_df.groupby(by=['key', 'pos', 'is_home']):
-            # Get team abbreviation based on home/away
-            abbr = group_df['home_abbr'].values[0] if is_home == 1 else group_df['away_abbr'].values[0]
-            
-            # Get player IDs for this group
-            pids = group_df['pid'].tolist()
-            
-            # Get ratings for this position
-            if pos not in player_ratings_dict:
-                logging.debug(f"Position {pos} not found in player_ratings")
-                continue
-            
-            ratings_df = player_ratings_dict[pos].copy()
-            
-            # Filter to matching game and players, calculate mean rating
-            rating_col = f'overall_{pos.lower()}_rating'
-            if rating_col not in ratings_df.columns:
-                logging.debug(f"Rating column {rating_col} not found for position {pos}")
-                continue
-            
-            matching_ratings = ratings_df[
-                (ratings_df['key'] == key) & 
-                (ratings_df['pid'].isin(pids))
-            ][rating_col]
-            
-            if not matching_ratings.empty:
-                avg_rating = matching_ratings.mean()
-                results[(key, pos, abbr)] = avg_rating
-        
-        # Convert results to DataFrame
-        result_df = pd.DataFrame.from_dict(
-            results, 
-            orient='index', 
-            columns=['avg_overall_rating']
-        ).reset_index()
-        
-        result_df[['key', 'pos', 'abbr']] = pd.DataFrame(
-            result_df['index'].tolist(), 
-            index=result_df.index
+        # Add team abbreviation based on is_home
+        starters_df['abbr'] = starters_df.apply(
+            lambda row: row['home_abbr'] if row['is_home'] == 1 else row['away_abbr'], 
+            axis=1
         )
-        result_df = result_df.drop(columns=['index'])
+        
+        # Combine all ratings into single DataFrame for efficient merging
+        all_ratings = []
+        for pos, ratings_df in player_ratings_dict.items():
+            rating_col = f'overall_{pos.lower()}_rating'
+            if rating_col in ratings_df.columns:
+                # Only keep necessary columns
+                temp = ratings_df[['key', 'pid', rating_col]].copy()
+                temp['pos'] = pos
+                temp = temp.rename(columns={rating_col: 'rating'})
+                all_ratings.append(temp)
+        
+        if not all_ratings:
+            logging.warning("No rating columns found in player_ratings")
+            return pd.DataFrame()
+        
+        # Concatenate all ratings
+        combined_ratings = pd.concat(all_ratings, ignore_index=True)
+        
+        # Merge starters with ratings
+        merged = starters_df.merge(
+            combined_ratings,
+            on=['key', 'pid', 'pos'],
+            how='inner'
+        )
+        
+        # Group and calculate averages using vectorized operations
+        result_df = merged.groupby(['key', 'year', 'game_date', 'pos', 'abbr'], as_index=False)['rating'].mean()
+        result_df = result_df.rename(columns={'rating': 'avg_overall_rating'})
+        
+        # Ensure game_date is datetime
+        result_df['game_date'] = pd.to_datetime(result_df['game_date'])
+        
+        # Sort results
+        result_df = result_df.sort_values(by=['key', 'game_date', 'abbr', 'pos'])
         
         logging.info(f"Calculated team position ratings: {len(result_df)} records")
-        return result_df[['key', 'abbr', 'pos', 'avg_overall_rating']].sort_values(by=['key', 'abbr', 'pos'])
+        return result_df[['key', 'year', 'game_date', 'abbr', 'pos', 'avg_overall_rating']]
 
     # ====================================================================
     # OFFICIALS
@@ -1073,6 +1107,17 @@ class DataObject:
         if not hasattr(self, '_new_officials'):
             self._new_officials = self._load_new_officials()
         return self._new_officials
+    
+    @property
+    def new_officials_with_features(self) -> pd.DataFrame:
+        """Load and cache processed new officials features."""
+        if not hasattr(self, '_new_officials_with_features'):
+            new_officials_df = self.new_officials
+            if new_officials_df.empty:
+                self._new_officials_with_features = pd.DataFrame()
+            else:
+                self._new_officials_with_features = self.get_new_officials_with_features(new_officials_df, cache=True)
+        return self._new_officials_with_features
     
     def _load_new_officials(self) -> pd.DataFrame:
         """Load new officials from CSV."""
@@ -1644,6 +1689,8 @@ class DataObject:
                             home_abbr if home_is_favorite else away_abbr
                         ])
             except Exception as e:
+                if row.get('vegas_line', '') == 'Pick':
+                    return pd.Series([0.0, True, np.nan, np.nan, np.nan])
                 logging.debug(f"Error parsing spread for {row['away_abbr']} vs {row['home_abbr']}, vegas_line='{row.get('vegas_line', '')}': {str(e)}")
                 return pd.Series([np.nan, np.nan, np.nan, np.nan, np.nan])
 
@@ -1929,6 +1976,11 @@ class DataObject:
 
         # spread features
         df = self.add_spread_info(df)
+
+        # map abbr columns
+        for col in df.columns:
+            if 'abbr' in col:
+                df[col] = df[col].map(TEAM_TO_PLAYER_ABBR_MAPPINGS).fillna(df[col])
         
         logging.info(f"Built game data with features: {len(df)} records")
         return df
@@ -2028,6 +2080,11 @@ if __name__ == "__main__":
     data_obj = DataObject(
         league='nfl',
         storage_mode='local',
-        local_root='G:/My Drive/python/winsight_api/sports-data-storage-copy/'
+        local_root=os.path.join(sys.path[0], "..", "..", "..", 'sports-data-storage-copy')
     )
-    df = data_obj._load_player_data()
+    df = data_obj.player_data
+    # position, target = 'QB', 'passing_yards'
+    # pos_df = df[df['pos'] == position]
+    # total_players = len(pos_df['pid'].unique())
+    
+    # logging.info(f"Training {position}_{target} with {total_players} players")

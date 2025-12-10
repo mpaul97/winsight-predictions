@@ -8,7 +8,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from winsight_predictions.nfl.players.data_object import DataObject
+from winsight_predictions.nfl.data_object import DataObject
 
 class MockS3Body:
     def __init__(self, data: str):

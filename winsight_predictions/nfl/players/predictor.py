@@ -37,21 +37,33 @@ if dependency layering changes) and ensure your models dict contains the
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+import time
 from typing import Dict, Any, List, Optional, Sequence, Callable, Tuple
 import os
 import logging
 import joblib
+import json
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-import asyncio
 import sys
+import traceback
+import asyncio
+from asyncio import Semaphore
+from copy import deepcopy
+import hashlib
 
 try:
     from .features import FeatureEngine
+    from .trainer import PlayerModelTrainer
     from ..data_object import DataObject
 except ImportError:
     from features import FeatureEngine
+    from trainer import PlayerModelTrainer
     # Get the absolute path of the directory containing the current script
     current_dir = os.path.dirname(os.path.abspath(__file__))
     # Add the parent directory to sys.path
@@ -61,146 +73,152 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---------------------------------------------------------------------------
-# Minimal fallback model (used when a factory isn't provided on training)
-# ---------------------------------------------------------------------------
-class MeanRegressor:
-    """Extremely small baseline: predicts global mean of y."""
-    def __init__(self):
-        self.mean_: float = 0.0
-    def fit(self, X: np.ndarray, y: Sequence[float]):  # type: ignore[override]
-        self.mean_ = float(np.mean(y)) if len(y) else 0.0
-    def predict(self, X: np.ndarray) -> np.ndarray:  # type: ignore[override]
-        return np.full(shape=(len(X),), fill_value=self.mean_, dtype=float)
-
-
-def default_model_factory() -> Any:
-    """Picklable default model factory used by PlayerModelTrainer.
-
-    Avoid using lambdas/closures to keep the trainer instance picklable for
-    process-based parallelism on Windows (spawn).
-    """
-    try:
-        from sklearn.ensemble import RandomForestRegressor
-        return RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
-    except Exception:
-        return MeanRegressor()
-
-
-def _derive_local_root_from_data_obj(do: "DataObject") -> Optional[str]:
-    """Best-effort derivation of the base local root from `DataObject`.
-
-    DataObject constructs per-league folders like `<base>/<league>/html_tables/`.
-    We reverse that to get `<base>/` so workers can re-create the same layout.
-    """
-    try:
-        path = getattr(do, 'local_data_dir', None)
-        league = getattr(do, 'league', None)
-        if not path or not league:
-            return None
-        norm = os.path.normpath(path)
-        # strip .../<league>/html_tables
-        p1 = os.path.dirname(norm)  # .../nfl/html_tables -> .../nfl
-        p2 = os.path.dirname(p1)    # .../nfl -> ...
-        return p2 + os.sep
-    except Exception:
-        return None
-
-
-def _train_target_worker(
-    ctx: Dict[str, Any],
-    position: str,
-    target: str,
-    min_games: int,
-    model_dir: str,
-) -> Tuple[str, Optional[Any], Optional[str]]:
-    """Subprocess-safe worker to train a single target.
-
-    Rebuilds a lightweight DataObject inside the process to avoid pickling
-    large in-memory frames from the parent. Returns (target, model, error_str).
-    """
-    try:
-        # Reconstruct DataObject in the subprocess
-        if ctx.get('storage_mode', 'local') == 'local':
-            data_obj = DataObject(
-                league=ctx.get('league', 'nfl'),
-                storage_mode='local',
-                local_root=ctx.get('local_root'),
-            )
-        else:
-            data_obj = DataObject(
-                league=ctx.get('league', 'nfl'),
-                storage_mode='s3',
-                s3_bucket=ctx.get('s3_bucket'),
-            )
-        trainer = PlayerModelTrainer(
-            data_obj=data_obj,
-            min_games=min_games,
-            model_factory=default_model_factory,
-            model_dir=model_dir,
-        )
-        model = trainer.train_target(position, target)
-        return (target, model, None)
-    except Exception as e:
-        logging.warning(f"Worker failed {position}_{target}: {e}")
-        return (target, None, str(e))
-
-
-# ---------------------------------------------------------------------------
-# PlayerPredictor (Inference)
+# PlayerPredictor (Optimized Inference)
 # ---------------------------------------------------------------------------
 @dataclass
 class PlayerPredictor:
     data_obj: DataObject
-    models: Dict[str, Any]  # key: POSITION_target -> fitted model
     min_games: int = 2
-    model_dir: str = "./models"
-    features_dir: str = "./predicted_features"
-    use_saved_scalers: bool = False
-    scalers: Dict[str, Any] = field(default_factory=dict)  # optional per-target scaler
-    model_feature_names: Dict[str, List[str]] = field(default_factory=dict)  # stored feature ordering per model
-
-    # Ordered target groups for iterative prediction
-    BASE_VOLUME: List[str] = field(default_factory=lambda: [
-        'attempted_passes', 'rush_attempts', 'times_pass_target'
-    ])
-    DERIVED_VOLUME: List[str] = field(default_factory=lambda: [
-        'completed_passes', 'receptions'
-    ])
-    EFFICIENCY: List[str] = field(default_factory=lambda: [
-        'passing_yards', 'passing_touchdowns', 'interceptions_thrown',
-        'rush_yards', 'rush_touchdowns', 'receiving_yards', 'receiving_touchdowns'
-    ])
-    FANTASY: List[str] = field(default_factory=lambda: ['fantasy_points'])
-    OVER_UNDER: List[str] = field(default_factory=lambda: [
-        'over_under_completed_passes_22+', 'over_under_passing_yards_250+',
-        'over_under_passing_touchdowns_2+', 'over_under_interceptions_thrown_1+',
-        'over_under_rush_yards_60+', 'over_under_rush_touchdowns_1+',
-        'over_under_receptions_5+', 'over_under_receiving_yards_60+',
-        'over_under_receiving_touchdowns_1+', 'over_under_rush_yards_&_receiving_yards_100+',
-        'over_under_rush_touchdowns_&_receiving_touchdowns_1+'
-    ])
+    root_dir: str = "./"
+    
+    # Internal caches (populated during __post_init__)
+    models: Dict[str, Any] = field(default_factory=dict, init=False)
+    scalers: Dict[str, Any] = field(default_factory=dict, init=False)
+    model_feature_names: Dict[str, List[str]] = field(default_factory=dict, init=False)
+    model_dir: str = field(default="", init=False)
+    features_dir: str = field(default="", init=False)
+    
+    # Cached data
+    _player_data: pd.DataFrame = field(default=None, init=False)
+    _upcoming_games: pd.DataFrame = field(default=None, init=False)
+    _starters: pd.DataFrame = field(default=None, init=False)
+    _feature_accumulator: Dict[str, pd.DataFrame] = field(default_factory=dict, init=False)
+    
+    # Dependency ordering for predictions
+    _target_order: Dict[str, int] = field(default_factory=lambda: {
+        # Base volume (no dependencies)
+        'attempted_passes': 0, 'rush_attempts': 0, 'times_pass_target': 0,
+        # Derived volume (depends on base)
+        'completed_passes': 1, 'receptions': 1,
+        # Efficiency (depends on volume)
+        'passing_yards': 2, 'passing_touchdowns': 2, 'interceptions_thrown': 2,
+        'rush_yards': 2, 'rush_touchdowns': 2, 'receiving_yards': 2, 'receiving_touchdowns': 2,
+        # Fantasy (depends on all)
+        'fantasy_points': 3,
+        # Over/under (depends on base predictions)
+        'over_under_completed_passes_22+': 4, 'over_under_passing_yards_250+': 4,
+        'over_under_passing_touchdowns_2+': 4, 'over_under_interceptions_thrown_1+': 4,
+        'over_under_rush_yards_60+': 4, 'over_under_rush_touchdowns_1+': 4,
+        'over_under_receptions_5+': 4, 'over_under_receiving_yards_60+': 4,
+        'over_under_receiving_touchdowns_1+': 4, 
+        'over_under_rush_yards_&_receiving_yards_100+': 4,
+        'over_under_rush_touchdowns_&_receiving_touchdowns_1+': 4,
+    }, init=False)
 
     def __post_init__(self):
+        self.model_dir = os.path.join(self.root_dir, "models")
+        self.features_dir = os.path.join(self.root_dir, "predicted_features")
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.features_dir, exist_ok=True)
 
-        self.features_cache = {}
+        # Load all models once
+        self._load_all_models()
+        
+        # Cache player data once
+        self._player_data = self.data_obj.player_data.copy()
+        
+        # Preload game data for PBP columns
+        _ = self.data_obj.get_game_data_with_features()
+        logging.info(f"Initialized PlayerPredictor with {len(self.models)} models")
 
-    def _build_feature_engine(
+        return
+    
+    def _load_all_models(self) -> None:
+        """Load all available model bundles from model_dir."""
+        if not os.path.exists(self.model_dir):
+            logging.warning(f"Model directory {self.model_dir} does not exist")
+            return
+        
+        count = 0
+        for position_dir in os.listdir(self.model_dir):
+            position_path = os.path.join(self.model_dir, position_dir)
+            if not os.path.isdir(position_path):
+                continue
+            
+            for filename in os.listdir(position_path):
+                if filename.endswith('_model.pkl'):
+                    target = filename.replace('_model.pkl', '')
+                    model_key = f"{position_dir}_{target}"
+                    model_path = os.path.join(position_path, filename)
+                    
+                    try:
+                        model_bundle = joblib.load(model_path)
+                        if isinstance(model_bundle, dict):
+                            self.models[model_key] = model_bundle.get('model')
+                            self.scalers[model_key] = model_bundle.get('scaler')
+                            self.model_feature_names[model_key] = model_bundle.get('feature_names', [])
+                            count += 1
+                        else:
+                            self.models[model_key] = model_bundle
+                            count += 1
+                    except Exception as e:
+                        logging.warning(f"Failed loading {model_path}: {e}")
+        
+        logging.info(f"Loaded {count} model bundles")
+    
+    def _get_upcoming_games(self) -> pd.DataFrame:
+        """Lazy-load and cache upcoming games."""
+        if self._upcoming_games is not None:
+            return self._upcoming_games
+        
+        previews = self.data_obj.previews.copy()
+        if previews.empty:
+            return pd.DataFrame()
+        
+        upcoming = previews[previews['is_home'] == 1].copy()
+        upcoming = upcoming.rename(columns={'abbr': 'home_abbr', 'opp_abbr': 'away_abbr'})
+        
+        current_week = previews['week'].mode()[0] if not previews['week'].empty else previews['week'].iloc[0]
+        current_year = previews['year'].mode()[0] if not previews['year'].empty else previews['year'].iloc[0]
+        
+        last_week = self.data_obj.schedules[
+            (self.data_obj.schedules['year'] == current_year) &
+            (self.data_obj.schedules['week'] < current_week)
+        ]['week'].max() if not self.data_obj.schedules.empty else 0
+        
+        upcoming['last_week'] = last_week
+        upcoming['home_division'] = upcoming['home_abbr'].map(self.data_obj.DIVISION_MAPPINGS).fillna('Unknown')
+        upcoming['home_conference'] = upcoming['home_abbr'].map(self.data_obj.CONFERENCE_MAPPINGS).fillna('Unknown')
+        upcoming['away_division'] = upcoming['away_abbr'].map(self.data_obj.DIVISION_MAPPINGS).fillna('Unknown')
+        upcoming['away_conference'] = upcoming['away_abbr'].map(self.data_obj.CONFERENCE_MAPPINGS).fillna('Unknown')
+        upcoming['key'] = upcoming['game_id']
+        
+        self._upcoming_games = upcoming
+        return self._upcoming_games
+    
+    def _predict_single_target(
         self,
-        prior_games: pd.DataFrame,
-        target: str,
-        row: pd.Series,
         position: str,
-        predictions: Optional[Dict[str, Any]] = None,
-        game_src_df: Optional[pd.DataFrame] = None,
-    ) -> FeatureEngine:
-        return FeatureEngine(
-            prior_games=prior_games,
+        target: str,
+        player_games: pd.DataFrame,
+        upcoming_row: pd.Series,
+        predictions: Dict[str, float],
+        accumulate_features: bool = False
+    ) -> Optional[float]:
+        """Generate prediction for a single target."""
+        model_key = f"{position}_{target}"
+        model = self.models.get(model_key)
+        
+        if model is None:
+            return None
+        
+        # Build feature engine
+        fe = FeatureEngine(
+            prior_games=player_games,
             target_name=target,
-            row=row,
+            row=upcoming_row,
             position=position,
-            predicted_features=predictions,  # Pass predictions for inference
+            predicted_features=predictions,
             player_data=self.data_obj.player_data,
             player_data_big_plays=self.data_obj.player_data[
                 ['key','game_date','home_abbr','away_abbr','abbr','pos', *self.data_obj.big_play_stat_columns]
@@ -210,348 +228,277 @@ class PlayerPredictor:
             player_group_ranks=self.data_obj.player_group_ranks,
             advanced_stat_cols=self.data_obj.advanced_stat_cols,
             big_play_stat_columns=self.data_obj.big_play_stat_columns,
-            game_src_df=game_src_df,
+            game_predictions=self.data_obj.next_game_predictions
         )
-
-    def predict_player(
-        self,
-        player_games: pd.DataFrame,
-        upcoming_row: pd.Series,
-        position: str,
-        target_subset: Optional[Sequence[str]] = None,
-    ) -> Dict[str, float]:
-        """Predict selected targets for a single upcoming game.
-
-        Parameters
-        ----------
-        player_games : DataFrame
-            Historical games for the player (chronologically sorted or unsorted; will be sorted).
-        upcoming_row : Series
-            Row describing the upcoming game context.
-        position : str
-            Player position (QB/RB/WR/TE).
-        target_subset : Sequence[str], optional
-            If provided, restrict predictions to these targets.
-        """
-        if len(player_games) < self.min_games:
-            raise ValueError(f"Need at least {self.min_games} prior games; got {len(player_games)}")
-        player_games = player_games.sort_values('game_date')
-        predictions: Dict[str, float] = {}
-        active = set(target_subset) if target_subset else None
-        ordered_groups = [self.BASE_VOLUME, self.DERIVED_VOLUME, self.EFFICIENCY, self.FANTASY, self.OVER_UNDER]
-        for group in ordered_groups:
-            for target in group:
-                if active and target not in active:
-                    continue
-                key = f"{position}_{target}"
-                model = self.models.get(key)
-                if model is None:
-                    continue
-                # Optional game-level predictions table
-                game_src_df = None
-                if hasattr(self.data_obj, 'next_game_predictions') and 'game_id' in upcoming_row.index:
-                    ngp = getattr(self.data_obj, 'next_game_predictions')
-                    if isinstance(ngp, pd.DataFrame) and 'game_id' in ngp.columns:
-                        game_src_df = ngp[ngp['game_id'] == upcoming_row.get('game_id')]
-                fe = self._build_feature_engine(
-                    prior_games=player_games,
-                    target=target,
-                    row=upcoming_row,
-                    position=position,
-                    predictions=predictions if predictions else None,
-                    game_src_df=game_src_df,
-                )
-                for key, grouped in fe.grouped_features_as_dfs.items():
-                    fe_key = f"{position}-{target}-{key}"
-                    grouped['pid'] = upcoming_row['pid']
-                    grouped['game_date'] = upcoming_row.get('game_date', np.nan)
-                    grouped['abbr'] = upcoming_row.get('abbr', np.nan)
-                    grouped['key'] = upcoming_row.get('key', np.nan)
-                    key_cols = ['pid', 'game_date', 'abbr', 'key']
-                    grouped = grouped[key_cols + [c for c in grouped.columns if c not in key_cols]]
-                    if fe_key not in self.features_cache:
-                        self.features_cache[fe_key] = grouped
-                    else:
-                        self.features_cache[fe_key] = pd.concat([self.features_cache[fe_key], grouped], ignore_index=True)
-                X_df = pd.DataFrame([fe.features])
-                # Ensure numeric-only and align to trained feature set if available
-                if key in self.model_feature_names:
-                    needed = self.model_feature_names[key]
-                    # add any missing needed cols with 0.0
-                    for col in needed:
-                        if col not in X_df.columns:
-                            X_df[col] = 0.0
-                    # drop unexpected extra cols
-                    X_df = X_df[needed]
+        
+        # Build feature matrix directly without CSV I/O
+        key_cols = ['pid', 'game_date', 'abbr', 'key']
+        all_features = []
+        
+        for group_name, group_df in fe.grouped_features_as_dfs.items():
+            group_df = group_df.copy()
+            # Add key columns
+            group_df['pid'] = upcoming_row['pid']
+            group_df['game_date'] = upcoming_row['game_date']
+            group_df['abbr'] = upcoming_row['abbr']
+            group_df['key'] = upcoming_row['key']
+            
+            # Reorder columns: key columns first, then features
+            feature_cols = [col for col in group_df.columns if col not in key_cols]
+            group_df = group_df[key_cols + feature_cols]
+            
+            # Accumulate features if requested (for saving like trainer)
+            if accumulate_features:
+                fe_key = f"{position}-{target}-{group_name}"
+                if fe_key not in self._feature_accumulator:
+                    self._feature_accumulator[fe_key] = group_df.copy()
                 else:
-                    X_df = X_df.select_dtypes(include=[np.number])
-                scaler = self.scalers.get(key) if self.use_saved_scalers else None
-                if scaler is not None:
-                    # if scaler has feature names ensure ordering
-                    fn = getattr(scaler, 'feature_names_in_', None)
-                    if fn is not None:
-                        missing = [c for c in fn if c not in X_df.columns]
-                        for c in missing:
-                            X_df[c] = 0.0
-                        X_df = X_df[fn]
-                    X_arr = scaler.transform(X_df.values)
-                else:
-                    X_arr = X_df.values
-                pred_val = float(model.predict(X_arr)[0])
-                predictions[target] = pred_val
-
-        # Save predicted features to CSV for inspection
-        for fe_key, feat_df in self.features_cache.items():
-            target = fe_key.split('-')[1]  # POSITION_target_key
-            feat_dir = os.path.join(self.features_dir, position, target) + "/"
-            os.makedirs(feat_dir, exist_ok=True)
-            fe_key = fe_key.replace('-', '_')
-            feat_path = os.path.join(feat_dir, f"{fe_key}.csv")
-            feat_df.to_csv(feat_path, index=False)
-            logging.info(f"Saved predicted feature group {fe_key} -> {feat_path}")
-
-        return predictions
-
-    def load_models_from_dir(self, positions: Sequence[str], targets: Sequence[str]) -> None:
-        """Load models from `model_dir` named as POSITION_target.pkl (joblib)."""
-        for pos in positions:
-            for tgt in targets:
-                key = f"{pos}_{tgt}"
-                path = os.path.join(self.model_dir, f"{key}.pkl")
-                if not os.path.exists(path):
-                    continue
-                try:
-                    obj = joblib.load(path)
-                    if isinstance(obj, dict) and 'model' in obj:
-                        self.models[key] = obj['model']
-                        if 'scaler' in obj and obj['scaler'] is not None:
-                            self.scalers[key] = obj['scaler']
-                        if 'feature_names' in obj and isinstance(obj['feature_names'], list):
-                            self.model_feature_names[key] = obj['feature_names']
-                    else:  # backward compatibility: raw model without metadata
-                        self.models[key] = obj
-                    logging.info(f"Loaded model: {path}")
-                except Exception as e:
-                    logging.warning(f"Failed loading {path}: {e}")
-
-    def save_model(self, key: str, model: Any, scaler: Any = None) -> None:
-        path = os.path.join(self.model_dir, f"{key}.pkl")
-        joblib.dump({'model': model, 'scaler': scaler}, path)
-        logging.info(f"Saved model {key} -> {path}")
-
-
-# ---------------------------------------------------------------------------
-# PlayerModelTrainer (Training)
-# ---------------------------------------------------------------------------
-@dataclass
-class PlayerModelTrainer:
-    data_obj: DataObject
-    min_games: int = 2
-    model_factory: Optional[Callable[[], Any]] = None
-    model_dir: str = "./models"
-    features_dir: str = "./features"
-
-    def __post_init__(self):
-        os.makedirs(self.model_dir, exist_ok=True)
-        os.makedirs(self.features_dir, exist_ok=True)
-        if self.model_factory is None:
-            # Use a top-level function to keep instance picklable in parallel
-            self.model_factory = default_model_factory
-
-        self.features_cache = {}
-
-    def _build_feature_engine(
-        self,
-        prior_games: pd.DataFrame,
-        target: str,
-        row: pd.Series,
-        position: str,
-        predictions: Optional[Dict[str, Any]] = None,
-    ) -> FeatureEngine:
-        return FeatureEngine(
-            prior_games=prior_games,
-            target_name=target,
-            row=row,
-            position=position,
-            player_data=self.data_obj.player_data,
-            player_data_big_plays=self.data_obj.player_data[
-                ['key','game_date','home_abbr','away_abbr','abbr','pos', *self.data_obj.big_play_stat_columns]
-            ] if not self.data_obj.player_data.empty else pd.DataFrame(),
-            standings=self.data_obj.standings,
-            team_ranks=self.data_obj.team_ranks,
-            player_group_ranks=self.data_obj.player_group_ranks,
-            advanced_stat_cols=self.data_obj.advanced_stat_cols,
-            big_play_stat_columns=self.data_obj.big_play_stat_columns
-        )
-
-    def build_training_rows(self, player_games: pd.DataFrame, position: str, target: str) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        player_games = player_games.sort_values('game_date')
-        for idx in range(self.min_games, len(player_games)):
-            prior = player_games.iloc[:idx]
-            current = player_games.iloc[idx]
-            logging.info(f"Building training row for {current['pid']} on {current['game_date'].date()} target={target}")
-            fe = self._build_feature_engine(prior, target, current, position, predictions=None)  # No predictions for training
-            for key, grouped in fe.grouped_features_as_dfs.items():
-                fe_key = f"{position}_{target}_{key}"
-                grouped['pid'] = current['pid']
-                grouped['game_date'] = current.get('game_date', np.nan)
-                grouped['abbr'] = current.get('abbr', np.nan)
-                grouped['key'] = current.get('key', np.nan)
-                grouped['target'] = current.get(target, np.nan)
-                key_cols = ['pid','game_date','abbr','key','target']
-                grouped = grouped[key_cols + [c for c in grouped.columns if c not in key_cols]]
-                if fe_key not in self.features_cache:
-                    self.features_cache[fe_key] = grouped
-                else:
-                    self.features_cache[fe_key] = pd.concat([self.features_cache[fe_key], grouped], ignore_index=True)
-            feat = fe.features.copy()
-            feat[f"target_{target}"] = current.get(target, np.nan)
-            rows.append(feat)
-        return rows
-
-    def train_target(self, position: str, target: str, testing: bool = True) -> Any:
-        df = self.data_obj.player_data
-        if df.empty:
-            raise ValueError("player_data is empty; cannot train")
-        if testing:
-            df = df.sample(frac=0.1, random_state=42)
-        pos_df = df[df['pos'] == position]
-        all_rows: List[Dict[str, Any]] = []
-        for pid, pid_games in pos_df.groupby('pid'):
-            if len(pid_games) < self.min_games:
-                continue
-            all_rows.extend(self.build_training_rows(pid_games, position, target))
-        if not all_rows:
-            raise ValueError(f"No training rows generated for {position} {target}")
-        train_df = pd.DataFrame(all_rows).fillna(0.0)
-        y_col = f"target_{target}"
-        X_full = train_df.drop(columns=[y_col])
-        # keep only numeric columns; drop datetime/object to avoid float conversion errors
-        X = X_full.select_dtypes(include=[np.number]).copy()
-        y = train_df[y_col].values
-        # model_factory may be either a factory function or a class
-        model = self.model_factory() if callable(self.model_factory) else default_model_factory()
-        model.fit(X.values, y)
-        key = f"{position}_{target}"
-        joblib.dump({'model': model, 'feature_names': list(X.columns)}, os.path.join(self.model_dir, f"{key}.pkl"))
-        logging.info(f"Trained & saved model {key}; rows={len(train_df)} features={X.shape[1]} numeric_only")
-
-        # Write feature groups to CSV for inspection
-        for fe_key, feat_df in self.features_cache.items():
-            feat_dir = os.path.join(self.features_dir, position, target) + "/"
-            os.makedirs(feat_dir, exist_ok=True)
-            feat_path = os.path.join(feat_dir, f"{fe_key}.csv")
-            feat_df.to_csv(feat_path, index=False)
-            logging.info(f"Saved feature group {fe_key} -> {feat_path}")
-
-        return model
-
-    def _train_one_safe(self, position: str, target: str):
-        try:
-            model = self.train_target(position, target)
-            return (target, model, None)
-        except Exception as e:
-            logging.warning(f"Skipping {position}_{target}: {e}")
-            return (target, None, e)
-
-    async def _train_target_async(
-        self,
-        ctx: Dict[str, Any],
-        position: str,
-        target: str,
-        min_games: int,
-        model_dir: str,
-    ) -> Tuple[str, Optional[Any], Optional[str]]:
-        """Async worker to train a single target."""
-        try:
-            if ctx.get('storage_mode', 'local') == 'local':
-                data_obj = DataObject(
-                    league=ctx.get('league', 'nfl'),
-                    storage_mode='local',
-                    local_root=ctx.get('local_root'),
-                )
-            else:
-                data_obj = DataObject(
-                    league=ctx.get('league', 'nfl'),
-                    storage_mode='s3',
-                    s3_bucket=ctx.get('s3_bucket'),
-                )
-            trainer = PlayerModelTrainer(
-                data_obj=data_obj,
-                min_games=min_games,
-                model_factory=default_model_factory,
-                model_dir=model_dir,
-            )
-            model = trainer.train_target(position, target)
-            return (target, model, None)
-        except Exception as e:
-            logging.warning(f"Async worker failed {position}_{target}: {e}")
-            return (target, None, str(e))
-
-    async def _run_train_tasks(
-        self,
-        ctx: Dict[str, Any],
-        position: str,
-        targets: Sequence[str],
-        min_games: int,
-        model_dir: str,
-    ) -> List[Tuple[str, Optional[Any], Optional[str]]]:
-        """Run training tasks asynchronously."""
-        tasks = [
-            self._train_target_async(ctx, position, target, min_games, model_dir)
-            for target in targets
-        ]
-        return await asyncio.gather(*tasks)
-
-    def train_many(self, position: str, targets: Sequence[str]) -> Dict[str, Any]:
-        """Train multiple targets asynchronously."""
-        if not targets:
-            return {}
-
-        ctx: Dict[str, Any] = {
-            'league': getattr(self.data_obj, 'league', 'nfl'),
-            'storage_mode': getattr(self.data_obj, 'storage_mode', 'local'),
-        }
-        if ctx['storage_mode'] == 'local':
-            ctx['local_root'] = _derive_local_root_from_data_obj(self.data_obj)
+                    self._feature_accumulator[fe_key] = pd.concat(
+                        [self._feature_accumulator[fe_key], group_df], 
+                        ignore_index=True
+                    )
+            
+            # Add group_name suffix to features AFTER accumulating
+            group_df.columns = [
+                f"{col}_{group_name}" if col not in key_cols else col 
+                for col in group_df.columns
+            ]
+                    
+            all_features.append(group_df)
+        
+        # Merge all feature groups
+        if not all_features:
+            return None
+        
+        merged_df = all_features[0]
+        for df in all_features[1:]:
+            merged_df = merged_df.merge(df, on=key_cols, how='outer', suffixes=('', '_dup'))
+            # Drop duplicate columns
+            merged_df = merged_df[[c for c in merged_df.columns if not c.endswith('_dup')]]
+        
+        # Prepare feature matrix
+        X_pred = merged_df.drop(columns=key_cols, errors='ignore')
+        X_pred = X_pred.select_dtypes(exclude=[object])
+        
+        # Align to training features
+        feature_names = self.model_feature_names.get(model_key, [])
+        if feature_names:
+            # Add missing columns with zeros
+            for col in feature_names:
+                if col not in X_pred.columns:
+                    X_pred[col] = 0.0
+            # Reorder to match training
+            X_pred = X_pred[feature_names]
+        
+        X_pred = X_pred.fillna(0.0)
+        
+        # Scale and predict
+        scaler = self.scalers.get(model_key)
+        if scaler is not None:
+            X_pred_scaled = scaler.transform(X_pred)
         else:
-            ctx['s3_bucket'] = getattr(self.data_obj, 's3_bucket', None)
-
-        loop = asyncio.get_event_loop()
-        results = loop.run_until_complete(
-            self._run_train_tasks(ctx, position, targets, self.min_games, self.model_dir)
+            X_pred_scaled = X_pred.values
+        
+        return float(model.predict(X_pred_scaled)[0])
+    
+    def predict_single_player(
+        self, 
+        pid: str, 
+        position: str, 
+        target_subset: Optional[List[str]] = None,
+        show: Optional[bool] = False,
+        accumulate_features: bool = False
+    ) -> Optional[Dict[str, float]]:
+        """Predict targets for a single player.
+        
+        Args:
+            pid: Player ID
+            position: Player position (e.g., 'QB', 'RB', 'WR', 'TE')
+            target_subset: Optional list of specific targets. If None, predict all available.
+            
+        Returns:
+            Dictionary of predictions {target: value} or None if prediction fails
+        """
+        # Get player games
+        player_games = self._player_data[
+            (self._player_data['pid'] == pid) & 
+            (self._player_data['pos'] == position)
+        ].sort_values('game_date')
+        
+        if len(player_games) < self.min_games:
+            logging.warning(f"Player {pid} has only {len(player_games)} games (need {self.min_games})")
+            return None
+        
+        # Get upcoming game
+        team_abbr = player_games['abbr'].iloc[-1]
+        upcoming_games = self._get_upcoming_games()
+        
+        if upcoming_games.empty:
+            logging.warning("No upcoming games available")
+            return None
+        
+        upcoming_game = upcoming_games[
+            (upcoming_games['home_abbr'] == team_abbr) | 
+            (upcoming_games['away_abbr'] == team_abbr)
+        ]
+        
+        if upcoming_game.empty:
+            logging.warning(f"No upcoming game for team {team_abbr}")
+            return None
+        
+        # Prepare upcoming row
+        upcoming_row = upcoming_game.iloc[0].copy()
+        upcoming_row['pid'] = pid
+        upcoming_row['abbr'] = team_abbr
+        upcoming_row['position'] = position
+        upcoming_row['starter'] = int(pid in self.data_obj.starters_new['player_id'].values)
+        
+        # Check game is in future
+        if upcoming_row['game_date'] <= pd.Timestamp(datetime.now().date()):
+            logging.warning(f"Game date {upcoming_row['game_date']} is not in the future")
+            return None
+        
+        # Determine targets to predict
+        if target_subset:
+            available_targets = [t for t in target_subset if f"{position}_{t}" in self.models]
+        else:
+            available_targets = [
+                key.replace(f"{position}_", "") 
+                for key in self.models.keys() 
+                if key.startswith(f"{position}_")
+            ]
+        
+        if not available_targets: 
+            logging.debug(f"No models available for {position}")
+            return None
+        
+        # Sort targets by dependency order
+        ordered_targets = sorted(
+            available_targets, 
+            key=lambda t: self._target_order.get(t, 999)
         )
+        
+        # Generate predictions
+        predictions = {}
+        for target in ordered_targets:
+            try:
+                pred = self._predict_single_target(
+                    position, target, player_games, upcoming_row, predictions, accumulate_features
+                )
+                if pred is not None:
+                    predictions[target] = pred
+            except Exception as e:
+                logging.warning(f"Failed to predict {target} for {pid}: {e}")
+        
+        if predictions:
+            predictions.update({
+                'pid': pid,
+                'position': position,
+                'team_abbr': team_abbr,
+                'player_name': player_games['player_display_name'].iloc[-1] if 'player_display_name' in player_games.columns else ''
+            })
+            if show:
+                logging.info(f"Generated {len(predictions)-3} predictions for {pid}")
+                for k, v in predictions.items():
+                    if k not in ['pid', 'position', 'team_abbr', 'player_name']:
+                        print(f"  {k}: {v:.2f}")
+        
+        return predictions if predictions else None
+    
+    def predict_next_players(
+        self,
+        positions: Optional[List[str]] = None,
+        save_results: bool = True,
+        save_features: bool = True
+    ) -> Optional[pd.DataFrame]:
+        """Predict for all starters in upcoming games.
+        
+        Args:
+            positions: Optional list of positions to predict. If None, predict all.
+            save_results: Whether to save predictions to CSV
+            save_features: Whether to save feature groupings (like trainer)
+            
+        Returns:
+            DataFrame with predictions or None if no predictions generated
+        """
+        # Clear feature accumulator if saving features
+        if save_features:
+            self._feature_accumulator.clear()
+        
+        starters = self.data_obj.starters_new
+        if starters.empty:
+            logging.warning("No starters data available")
+            return None
+        
+        # Filter by positions if specified
+        if positions:
+            starters = starters[starters['position'].isin(positions)]
+        
+        all_predictions = []
+        for _, row in tqdm(starters.iterrows(), total=len(starters), desc="Predicting players"):
+            pid = row['player_id']
+            position = row['position']
+            
+            predictions = self.predict_single_player(
+                pid=pid, 
+                position=position, 
+                accumulate_features=save_features
+            )
+            if predictions:
+                all_predictions.append(predictions)
+        
+        if not all_predictions:
+            logging.warning("No predictions generated")
+            return None
+        
+        df = pd.DataFrame(all_predictions)
+        logging.info(f"Generated predictions for {len(df)} players")
+        
+        if save_results:
+            local_predictions_dir = './player_predictions/'
+            os.makedirs(local_predictions_dir, exist_ok=True)
+            df = df[['pid', 'player_name', 'position', 'team_abbr'] + [col for col in df.columns if col not in ['pid', 'player_name', 'position', 'team_abbr']]]
+            df.round(2).to_csv(
+                os.path.join(local_predictions_dir, 'next_player_predictions.csv'), 
+                index=False
+            )
+            logging.info(f"Saved predictions to {local_predictions_dir}next_player_predictions.csv")
+        
+        # Save feature groupings if requested
+        if save_features and self._feature_accumulator:
+            self._save_feature_groupings()
+        
+        return df
+    
+    def _save_feature_groupings(self) -> None:
+        """Save accumulated feature groupings to CSV files (trainer format)."""
+        for fe_key, df in self._feature_accumulator.items():
+            pos, target, group_name = fe_key.split("-")
+            _dir = os.path.join(self.features_dir, pos, target)
+            os.makedirs(_dir, exist_ok=True)
+            filepath = os.path.join(_dir, f"{group_name}_features.csv")
+            df.to_csv(filepath, index=False)
+            logging.debug(f"Saved feature group: {fe_key}, Shape: {df.shape} -> {filepath}")
+        
+        logging.info(f"Saved {len(self._feature_accumulator)} feature groupings")
+        self._feature_accumulator.clear()
 
-        out: Dict[str, Any] = {k: m for (k, m, e) in results if m is not None}
-        return out
-
-
-if __name__ == "__main__":  # minimal manual smoke example
+if __name__ == "__main__":
+    # Example usage
     data_obj = DataObject(
         league='nfl',
         storage_mode='local',
-        local_root='G:/My Drive/python/winsight_api/sports-data-storage-copy/'
+        local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
     )
-    trainer = PlayerModelTrainer(data_obj)
-    # Example: train a couple QB volume stats if data present
-    sample_targets = [
-        'attempted_passes', 'completed_passes', 'passing_yards', 'passing_touchdowns',
-		'interceptions_thrown', 'rush_attempts', 'rush_yards', 'rush_touchdowns'
-    ]
-    try:
-        trainer.train_many('QB', sample_targets)
-    except Exception as e:
-        logging.warning(f"Training skipped (sample): {e}")
-    predictor = PlayerPredictor(data_obj=data_obj, models={})
-    predictor.load_models_from_dir(['QB'], sample_targets)
-    sample_qb = data_obj.player_data[data_obj.player_data['pos']=='QB']
-    if not sample_qb.empty:
-        gid = 'LoveJo03'  # example player ID
-        games: pd.DataFrame = sample_qb[sample_qb['pid']==gid]
-        abbr = games['abbr'].iloc[-1]
-        upcoming: pd.Series = data_obj.previews[data_obj.previews['abbr']==abbr].iloc[0]
-        upcoming['pid'] = gid
-        upcoming = upcoming.rename({'game_id':'key'})
-        preds = predictor.predict_player(games, upcoming, 'QB', target_subset=sample_targets)
-        logging.info(f"Smoke predictions: {preds}")
+    
+    predictor = PlayerPredictor(data_obj=data_obj)
+    
+    # Example 1: Predict for a single player (all targets)
+    # predictor.predict_single_player(pid='LoveJo03', position='QB', show=True)
+    
+    # Example 2: Predict for all starters
+    predictor.predict_next_players()
+    
+    # Example 3: Predict for specific positions and save feature groupings (like trainer)
+    # predictor.predict_next_players(positions=['QB', 'RB'], save_results=True, save_features=True)
+

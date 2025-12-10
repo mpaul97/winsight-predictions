@@ -43,8 +43,15 @@ htmlcov/
 **/models/
 **/features/
 **/predicted_features/
+**/train/
 
 # data files
 *.csv
 *.json
 *.pkl
+*.ipynb
+**/game_predictions/
+**/player_predictions/
+
+# environment files
+.env
