@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=72.1.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winsight-predictions"
+version = "0.1.0"
+description = "Predictive features and utilities for sports leagues (NFL/NBA/MLB)."
+readme = "README.md"
+requires-python = ">=3.13"
+license = {text = "MIT"}
+authors = []
+keywords = ["sports", "predictions", "nfl", "nba", "mlb", "machine-learning"]
+
+dependencies = [
+    "pandas>=2.3.3",
+    "numpy>=2.2.0,<2.4.0",
+    "scikit-learn>=1.7.2",
+    "mp_sportsipy>=0.6.0",
+    "boto3>=1.40.54",
+    "joblib>=1.5.2",
+    "python-dotenv>=1.2.1",
+    "regex>=2025.9.1",
+    "tqdm>=4.67.1",
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Topic :: Software Development :: Libraries",
+]
+
+[tool.setuptools]
+packages = ["winsight_predictions", "winsight_predictions.nfl", "winsight_predictions.nfl.games", "winsight_predictions.nfl.players", "winsight_predictions.nba", "winsight_predictions.mlb"]
+
+[tool.setuptools.package-data]
+"winsight_predictions.nfl.games" = ["models/*.json"]
+"winsight_predictions.nfl.players" = ["models/**/*.json"]

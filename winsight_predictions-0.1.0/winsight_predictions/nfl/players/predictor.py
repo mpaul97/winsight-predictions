@@ -56,11 +56,6 @@ import asyncio
 from asyncio import Semaphore
 from copy import deepcopy
 import hashlib
-import boto3
-from io import BytesIO
-from dotenv import load_dotenv
-
-load_dotenv()
 
 try:
     from .features import FeatureEngine
@@ -138,107 +133,38 @@ class PlayerPredictor:
 
         return
     
-    def _load_model_from_s3(self, bucket: str, s3_key: str, s3_client) -> Optional[Any]:
-        """Load a model file from S3.
-        
-        Args:
-            bucket: S3 bucket name
-            s3_key: S3 object key
-            s3_client: boto3 S3 client
-            
-        Returns:
-            Loaded model object or None if failed
-        """
-        try:
-            response = s3_client.get_object(Bucket=bucket, Key=s3_key)
-            model_bytes = response['Body'].read()
-            model_bundle = joblib.load(BytesIO(model_bytes))
-            return model_bundle
-        except Exception as e:
-            logging.warning(f"Failed loading s3://{bucket}/{s3_key}: {e}")
-            return None
-    
     def _load_all_models(self) -> None:
-        """Load all available model bundles from model_dir or S3."""
+        """Load all available model bundles from model_dir."""
+        if not os.path.exists(self.model_dir):
+            logging.warning(f"Model directory {self.model_dir} does not exist")
+            return
+        
         count = 0
-        
-        if self.data_obj.storage_mode == "s3":
-            # Load models from S3
-            bucket_name = os.getenv("LEAGUE_PREDICTIONS_BUCKET_NAME")
-            if not bucket_name:
-                logging.error("LEAGUE_PREDICTIONS_BUCKET_NAME environment variable not set for S3 mode.")
-                return
+        for position_dir in os.listdir(self.model_dir):
+            position_path = os.path.join(self.model_dir, position_dir)
+            if not os.path.isdir(position_path):
+                continue
             
-            s3_client = boto3.client('s3')
-            s3_prefix = 'nfl/players/'
-            
-            try:
-                # List all objects under the nfl/players/ prefix
-                paginator = s3_client.get_paginator('list_objects_v2')
-                pages = paginator.paginate(Bucket=bucket_name, Prefix=s3_prefix)
-                
-                for page in pages:
-                    if 'Contents' not in page:
-                        continue
+            for filename in os.listdir(position_path):
+                if filename.endswith('_model.pkl'):
+                    target = filename.replace('_model.pkl', '')
+                    model_key = f"{position_dir}_{target}"
+                    model_path = os.path.join(position_path, filename)
                     
-                    for obj in page['Contents']:
-                        key = obj['Key']
-                        if key.endswith('_model.pkl'):
-                            # Extract position and target from S3 key
-                            # Expected format: nfl/players/POSITION/TARGET_model.pkl
-                            parts = key.replace(s3_prefix, '').split('/')
-                            if len(parts) >= 2:
-                                position_dir = parts[0]
-                                filename = parts[1]
-                                target = filename.replace('_model.pkl', '')
-                                model_key = f"{position_dir}_{target}"
-                                
-                                model_bundle = self._load_model_from_s3(bucket_name, key, s3_client)
-                                if model_bundle:
-                                    if isinstance(model_bundle, dict):
-                                        self.models[model_key] = model_bundle.get('model')
-                                        self.scalers[model_key] = model_bundle.get('scaler')
-                                        self.model_feature_names[model_key] = model_bundle.get('feature_names', [])
-                                        count += 1
-                                    else:
-                                        self.models[model_key] = model_bundle
-                                        count += 1
-            except Exception as e:
-                logging.error(f"Failed listing S3 models: {e}")
+                    try:
+                        model_bundle = joblib.load(model_path)
+                        if isinstance(model_bundle, dict):
+                            self.models[model_key] = model_bundle.get('model')
+                            self.scalers[model_key] = model_bundle.get('scaler')
+                            self.model_feature_names[model_key] = model_bundle.get('feature_names', [])
+                            count += 1
+                        else:
+                            self.models[model_key] = model_bundle
+                            count += 1
+                    except Exception as e:
+                        logging.warning(f"Failed loading {model_path}: {e}")
         
-        else:
-            # Load models from local filesystem
-            if not os.path.exists(self.model_dir):
-                logging.warning(f"Model directory {self.model_dir} does not exist")
-                return
-            
-            for position_dir in os.listdir(self.model_dir):
-                position_path = os.path.join(self.model_dir, position_dir)
-                if not os.path.isdir(position_path):
-                    continue
-                
-                for filename in os.listdir(position_path):
-                    if filename.endswith('_model.pkl'):
-                        target = filename.replace('_model.pkl', '')
-                        model_key = f"{position_dir}_{target}"
-                        model_path = os.path.join(position_path, filename)
-                        
-                        try:
-                            model_bundle = joblib.load(model_path)
-                            if isinstance(model_bundle, dict):
-                                self.models[model_key] = model_bundle.get('model')
-                                self.scalers[model_key] = model_bundle.get('scaler')
-                                self.model_feature_names[model_key] = model_bundle.get('feature_names', [])
-                                count += 1
-                            else:
-                                self.models[model_key] = model_bundle
-                                count += 1
-                        except Exception as e:
-                            logging.warning(f"Failed loading {model_path}: {e}")
-        
-        logging.info(f"Loaded {count} model bundles from {self.data_obj.storage_mode} storage")
-
-        return
+        logging.info(f"Loaded {count} model bundles")
     
     def _get_upcoming_games(self) -> pd.DataFrame:
         """Lazy-load and cache upcoming games."""
@@ -469,7 +395,7 @@ class PlayerPredictor:
                 'pid': pid,
                 'position': position,
                 'team_abbr': team_abbr,
-                'player_name': player_games['player_name'].iloc[-1] if 'player_name' in player_games.columns else ''
+                'player_name': player_games['player_display_name'].iloc[-1] if 'player_display_name' in player_games.columns else ''
             })
             if show:
                 logging.info(f"Generated {len(predictions)-3} predictions for {pid}")
@@ -532,7 +458,7 @@ class PlayerPredictor:
             local_predictions_dir = './player_predictions/'
             os.makedirs(local_predictions_dir, exist_ok=True)
             df = df[['pid', 'player_name', 'position', 'team_abbr'] + [col for col in df.columns if col not in ['pid', 'player_name', 'position', 'team_abbr']]]
-            df.sort_values(by=['fantasy_points'], ascending=False).round(2).to_csv(
+            df.round(2).to_csv(
                 os.path.join(local_predictions_dir, 'next_player_predictions.csv'), 
                 index=False
             )
@@ -564,11 +490,6 @@ if __name__ == "__main__":
         storage_mode='local',
         local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
     )
-
-    # data_obj = DataObject(
-    #     storage_mode='s3',
-    #     s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
-    # )
     
     predictor = PlayerPredictor(data_obj=data_obj)
     

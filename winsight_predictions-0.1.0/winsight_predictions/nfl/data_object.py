@@ -172,7 +172,6 @@ class DataObject:
             return pd.read_csv(path, **kwargs)
         # S3 path treated as key
         try:
-            path = str(path).replace("//", "/").replace("\\", "/")
             resp = self._s3.get_object(Bucket=self.s3_bucket, Key=path)
             content = resp["Body"].read().decode("utf-8")
             return pd.read_csv(StringIO(content), **kwargs)
@@ -238,7 +237,7 @@ class DataObject:
         logging.info("Loading schedules...")
         df = pd.DataFrame()
         
-        if not os.path.exists(self.local_schedules_dir) and self.storage_mode == "local":
+        if not os.path.exists(self.local_schedules_dir):
             logging.warning(f"Schedules directory not found: {self.local_schedules_dir}")
             return df
         
@@ -301,7 +300,7 @@ class DataObject:
         """Load most recent preview file."""
         logging.info("Loading previews...")
         
-        if not os.path.exists(self.previews_dir) and self.storage_mode == "local":
+        if not os.path.exists(self.previews_dir):
             logging.warning(f"Previews directory not found: {self.previews_dir}")
             return pd.DataFrame()
         
@@ -383,7 +382,7 @@ class DataObject:
         """Load most recent starters file."""
         logging.info("Loading new starters...")
         
-        if not os.path.exists(self.starters_dir) and self.storage_mode == "local":
+        if not os.path.exists(self.starters_dir):
             logging.warning(f"Starters directory not found: {self.starters_dir}")
             return pd.DataFrame()
         
@@ -726,7 +725,7 @@ class DataObject:
         logging.info("Loading PBP features...")
         pbp_dict = {}
         
-        if not os.path.exists(self.local_pbp_features_dir) and self.storage_mode == "local":
+        if not os.path.exists(self.local_pbp_features_dir):
             logging.warning(f"PBP features directory not found: {self.local_pbp_features_dir}")
             return pbp_dict
         
@@ -821,7 +820,7 @@ class DataObject:
         
         df = pd.DataFrame()
         
-        if not os.path.exists(local_dir) and self.storage_mode == "local":
+        if not os.path.exists(local_dir):
             logging.warning(f"Team ranks directory not found: {local_dir}")
             return df
         
@@ -879,7 +878,7 @@ class DataObject:
         
         df = pd.DataFrame()
         
-        if not os.path.exists(local_dir) and self.storage_mode == "local":
+        if not os.path.exists(local_dir):
             logging.warning(f"Player group ranks directory not found: {local_dir}")
             return df
         
@@ -2077,12 +2076,15 @@ class DataObject:
         return self._listdir(directory_or_prefix)
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
-    load_dotenv()
     # Example usage
     data_obj = DataObject(
-        storage_mode='s3',
-        s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
+        league='nfl',
+        storage_mode='local',
+        local_root=os.path.join(sys.path[0], "..", "..", "..", 'sports-data-storage-copy')
     )
-    df = data_obj.previews
-    print(df)
+    df = data_obj.player_data
+    # position, target = 'QB', 'passing_yards'
+    # pos_df = df[df['pos'] == position]
+    # total_players = len(pos_df['pid'].unique())
+    
+    # logging.info(f"Training {position}_{target} with {total_players} players")

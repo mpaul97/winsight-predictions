@@ -21,10 +21,6 @@ from asyncio import Semaphore
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor
 import hashlib
-import boto3
-from dotenv import load_dotenv
-    
-load_dotenv()
 
 try:
     from .features import FeatureEngine
@@ -36,8 +32,6 @@ except ImportError:
     # Add the parent directory to sys.path
     sys.path.append(os.path.dirname(current_dir))
     from data_object import DataObject
-
-s3 = boto3.client('s3')
 
 logging.basicConfig(level=logging.INFO)
 
@@ -507,40 +501,6 @@ class PlayerModelTrainer:
         
         return X
 
-    def _save_model_metrics(self, position: str, target: str, metrics: dict):
-        """Save model metrics to model_metrics.json file.
-        
-        Args:
-            position: Player position
-            target: Target variable
-            metrics: Dictionary containing model metrics
-        """
-        metrics_file = os.path.join(self.models_dir, "model_metrics.json")
-        
-        # Load existing metrics if file exists
-        if os.path.exists(metrics_file):
-            with open(metrics_file, 'r') as f:
-                all_metrics = json.load(f)
-        else:
-            all_metrics = {}
-        
-        # Add new metrics with position_target key
-        model_key = f"{position}_{target}"
-        all_metrics[model_key] = metrics
-        
-        # Sort by R2 score (best models first)
-        sorted_metrics = dict(sorted(
-            all_metrics.items(),
-            key=lambda x: x[1].get('r2_score', 0),
-            reverse=True
-        ))
-        
-        # Save back to file
-        with open(metrics_file, 'w') as f:
-            json.dump(sorted_metrics, f, indent=2)
-        
-        logging.info(f"Saved metrics for {model_key} to {metrics_file}")
-
     def _train_and_evaluate_model(self, X: pd.DataFrame, y: pd.Series, position: str, target: str):
         """Train and evaluate a model for the given features and target.
         
@@ -619,6 +579,40 @@ class PlayerModelTrainer:
         # Clean up memory
         del X_train, X_test, X_train_scaled, X_test_scaled
 
+    def _save_model_metrics(self, position: str, target: str, metrics: dict):
+        """Save model metrics to model_metrics.json file.
+        
+        Args:
+            position: Player position
+            target: Target variable
+            metrics: Dictionary containing model metrics
+        """
+        metrics_file = os.path.join(self.models_dir, "model_metrics.json")
+        
+        # Load existing metrics if file exists
+        if os.path.exists(metrics_file):
+            with open(metrics_file, 'r') as f:
+                all_metrics = json.load(f)
+        else:
+            all_metrics = {}
+        
+        # Add new metrics with position_target key
+        model_key = f"{position}_{target}"
+        all_metrics[model_key] = metrics
+        
+        # Sort by R2 score (best models first)
+        sorted_metrics = dict(sorted(
+            all_metrics.items(),
+            key=lambda x: x[1].get('r2_score', 0),
+            reverse=True
+        ))
+        
+        # Save back to file
+        with open(metrics_file, 'w') as f:
+            json.dump(sorted_metrics, f, indent=2)
+        
+        logging.info(f"Saved metrics for {model_key} to {metrics_file}")
+
     def train_models(self, max_features: int = 3000):
         """Load feature groupings and train models with memory-efficient approach.
         
@@ -650,27 +644,6 @@ class PlayerModelTrainer:
                 
         return
 
-    def upload_models_to_s3(self):
-        """Upload all models in the models directory to an S3 bucket."""
-        BUCKET_NAME = os.getenv("LEAGUE_PREDICTIONS_BUCKET_NAME")
-        if not BUCKET_NAME:
-            logging.error("LEAGUE_PREDICTIONS_BUCKET_NAME environment variable not set.")
-            return
-
-        for root, _, files in os.walk(self.models_dir):
-            for file in files:
-                if file.endswith(".pkl") or file.endswith(".json"):
-                    local_path = os.path.join(root, file)
-                    s3_path = os.path.relpath(local_path, self.models_dir)
-                    s3_path = str(os.path.join('nfl', 'players', s3_path)).replace("\\", "/")
-                    try:
-                        s3.upload_file(local_path, BUCKET_NAME, s3_path)
-                        logging.info(f"Uploaded {local_path} to s3://{BUCKET_NAME}/{s3_path}")
-                    except Exception as e:
-                        logging.error(f"Failed to upload {local_path} to S3: {e}")
-
-        return
-
 if __name__ == "__main__":
     data_obj = DataObject(
         league='nfl',
@@ -683,6 +656,4 @@ if __name__ == "__main__":
     # Example for debugging a single player
     # fe_instance = trainer.debug_feature_grouping(pid='LoveJo03', position='QB', target='passing_yards')
 
-    # trainer.train_models()
-
-    trainer.upload_models_to_s3()
+    trainer.train_models()

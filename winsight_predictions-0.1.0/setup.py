@@ -16,8 +16,9 @@ setup(
 	python_requires=">=3.13",
 	install_requires=[
 		"pandas>=2.3.3",
-		"numpy>=2.2.0,<2.4.0",
-        "scikit-learn>=1.7.2",
+		"numpy>=2.3.5",
+        "scikit_learn>=1.7.2",
+		"mp_sportsipy>=0.6.0",
 		"boto3>=1.40.54",
 		"joblib>=1.5.2",
 		"python-dotenv>=1.2.1",
