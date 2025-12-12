@@ -594,8 +594,7 @@ class PlayerPredictor:
             starters = starters[starters['position'].isin(positions)]
 
         # Run predictions asynchronously
-        loop = asyncio.get_event_loop()
-        all_predictions = loop.run_until_complete(
+        all_predictions = asyncio.run(
             self._run_predictions_async(starters, save_features)
         )
 
