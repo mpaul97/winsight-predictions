@@ -96,7 +96,9 @@ class GamePredictor:
         if not self.features_dir:
             self.features_dir = os.path.join(self.root_dir, "predicted_features")
         
-        os.makedirs(self.model_dir, exist_ok=True)
+        if self.data_obj.storage_mode == 'local':
+            os.makedirs(self.model_dir, exist_ok=True)
+            
         os.makedirs(self.features_dir, exist_ok=True)
 
         self.load_all_models()
@@ -733,7 +735,7 @@ class GamePredictor:
             logging.info(f"Added predictions for target {target}")
         
         if save_to_file and not df.empty:
-            local_predictions_dir = './game_predictions/'
+            local_predictions_dir = os.path.join(self.root_dir, 'game_predictions')
             os.makedirs(local_predictions_dir, exist_ok=True)
             file_path = os.path.join(local_predictions_dir, 'all_past_game_predictions.csv')
             

@@ -145,7 +145,10 @@ class PlayerPredictor:
     def __post_init__(self):
         self.model_dir = os.path.join(self.root_dir, "models")
         self.features_dir = os.path.join(self.root_dir, "predicted_features")
-        os.makedirs(self.model_dir, exist_ok=True)
+        
+        if self.data_obj.storage_mode == 'local':
+            os.makedirs(self.model_dir, exist_ok=True)
+
         os.makedirs(self.features_dir, exist_ok=True)
 
         # Load all models once
