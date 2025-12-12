@@ -325,6 +325,70 @@ class GamePredictor:
             **self._fe_common_params
         )
 
+    def merge_feature_groupings(self, target: str) -> pd.DataFrame:
+        """Merge all feature grouping files for a target into one DataFrame.
+        
+        Reads all CSV files from self.features_dir/{target}/ and merges them
+        on the key columns (game_id, game_date, home_abbr, away_abbr).
+        Note: Prediction features don't have 'target' column.
+        
+        Args:
+            target: Target name (e.g., 'home_points', 'away_rush_yards')
+            
+        Returns:
+            Merged DataFrame with all features for the target
+        """
+        target_dir = os.path.join(self.features_dir, target)
+        if not os.path.exists(target_dir):
+            logging.warning(f"Feature directory does not exist: {target_dir}")
+            return pd.DataFrame()
+        
+        # Find all CSV files in the target directory
+        csv_files = [f for f in os.listdir(target_dir) if f.endswith('.csv')]
+        if not csv_files:
+            logging.warning(f"No CSV files found in {target_dir}")
+            return pd.DataFrame()
+        
+        logging.info(f"Merging {len(csv_files)} feature grouping files for {target}")
+        
+        # Key columns that should appear in all files (predictions don't have 'target')
+        key_cols = ['game_id', 'game_date', 'home_abbr', 'away_abbr']
+        
+        merged_df = None
+        for csv_file in csv_files:
+            file_path = os.path.join(target_dir, csv_file)
+            try:
+                df = pd.read_csv(file_path)
+                group_name = csv_file.replace('.csv', '').replace(f"{target}_", '')
+
+                df = df.rename(columns={col: f"{col}_{group_name}" for col in df.columns if col not in key_cols})
+
+                if merged_df is None:
+                    # First file - use it as base
+                    merged_df = df
+                else:
+                    # Merge with existing data
+                    # Identify feature columns (non-key columns)
+                    feature_cols = [col for col in df.columns if col not in key_cols]
+                    
+                    # Merge on key columns, adding only the feature columns
+                    merged_df = merged_df.merge(
+                        df[key_cols + feature_cols],
+                        on=key_cols,
+                        how='outer'
+                    )
+            except Exception as e:
+                logging.warning(f"Failed to read {csv_file}: {e}")
+                continue
+        
+        if merged_df is not None:
+            logging.info(f"Merged features for {target}: {len(merged_df)} rows, {len(merged_df.columns)} columns")
+        else:
+            logging.warning(f"Failed to merge any features for {target}")
+            merged_df = pd.DataFrame()
+        
+        return merged_df
+
     def predict_game(
         self,
         game_data: pd.DataFrame,
@@ -407,7 +471,7 @@ class GamePredictor:
             
             # Drop key columns and align to training columns
             X_pred = merged_df.drop(columns=key_cols, errors='ignore')
-            
+
             # Align to training feature names if available
             if feature_names:
                 # Ensure we have exactly the features the model was trained on
@@ -415,17 +479,17 @@ class GamePredictor:
                 extra_cols = [col for col in X_pred.columns if col not in feature_names]
                 
                 if missing_cols:
-                    logging.debug(f"Adding {len(missing_cols)} missing columns for {target}")
+                    logging.info(f"Adding {len(missing_cols)} missing columns for {target}")
                     # Create missing columns DataFrame and concat instead of iterative insertion
                     missing_df = pd.DataFrame(0.0, index=X_pred.index, columns=missing_cols)
                     X_pred = pd.concat([X_pred, missing_df], axis=1)
                 
                 if extra_cols:
-                    logging.debug(f"Dropping {len(extra_cols)} extra columns for {target}")
+                    logging.info(f"Dropping {len(extra_cols)} extra columns for {target}")
                 
                 # Reorder to match training
                 X_pred = X_pred[feature_names]
-            
+
             # Fill NaN with 0.0 BEFORE scaling (like the notebook)
             X_pred = X_pred.fillna(0.0)
             
@@ -509,67 +573,6 @@ class GamePredictor:
         game_data = self.data_obj.get_game_data_with_features()
         predictions = self.predict_game(game_data, game_row.iloc[0])
         return predictions
-
-    def merge_feature_groupings(self, target: str) -> pd.DataFrame:
-        """Merge all feature grouping files for a target into one DataFrame.
-        
-        Reads all CSV files from self.features_dir/{target}/ and merges them
-        on the key columns (game_id, game_date, home_abbr, away_abbr).
-        Note: Prediction features don't have 'target' column.
-        
-        Args:
-            target: Target name (e.g., 'home_points', 'away_rush_yards')
-            
-        Returns:
-            Merged DataFrame with all features for the target
-        """
-        target_dir = os.path.join(self.features_dir, target)
-        if not os.path.exists(target_dir):
-            logging.warning(f"Feature directory does not exist: {target_dir}")
-            return pd.DataFrame()
-        
-        # Find all CSV files in the target directory
-        csv_files = [f for f in os.listdir(target_dir) if f.endswith('.csv')]
-        if not csv_files:
-            logging.warning(f"No CSV files found in {target_dir}")
-            return pd.DataFrame()
-        
-        logging.info(f"Merging {len(csv_files)} feature grouping files for {target}")
-        
-        # Key columns that should appear in all files (predictions don't have 'target')
-        key_cols = ['game_id', 'game_date', 'home_abbr', 'away_abbr']
-        
-        merged_df = None
-        for csv_file in csv_files:
-            file_path = os.path.join(target_dir, csv_file)
-            try:
-                df = pd.read_csv(file_path)
-                
-                if merged_df is None:
-                    # First file - use it as base
-                    merged_df = df
-                else:
-                    # Merge with existing data
-                    # Identify feature columns (non-key columns)
-                    feature_cols = [col for col in df.columns if col not in key_cols]
-                    
-                    # Merge on key columns, adding only the feature columns
-                    merged_df = merged_df.merge(
-                        df[key_cols + feature_cols],
-                        on=key_cols,
-                        how='outer'
-                    )
-            except Exception as e:
-                logging.warning(f"Failed to read {csv_file}: {e}")
-                continue
-        
-        if merged_df is not None:
-            logging.info(f"Merged features for {target}: {len(merged_df)} rows, {len(merged_df.columns)} columns")
-        else:
-            logging.warning(f"Failed to merge any features for {target}")
-            merged_df = pd.DataFrame()
-        
-        return merged_df
 
     def predict_all_next_games(self, save_to_file: bool = False, upload_to_s3: bool = False) -> pd.DataFrame:
         """Predict all upcoming games from data_obj.previews using all loaded models.
@@ -657,9 +660,7 @@ class GamePredictor:
             
         Returns:
             DataFrame with predictions for all historical games
-        """
-        from .trainer import GameModelTrainer
-        
+        """ 
         trainer = GameModelTrainer(self.data_obj)
         df = pd.DataFrame()
         
@@ -761,8 +762,6 @@ class GamePredictor:
         Returns:
             DataFrame with all predictions including newly added ones
         """
-        from .trainer import GameModelTrainer
-        
         boxscores = self.data_obj.boxscores
         if boxscores.empty:
             logging.warning("No boxscore data available to update past predictions")
@@ -786,16 +785,26 @@ class GamePredictor:
             logging.info("No missing game predictions found; all up to date")
             return existing_df
         
-        logging.info(f"Found {len(missing_keys)} missing game predictions to update")
+        logging.info(f"Found {len(missing_keys)} missing game predictions to update \n {missing_keys}")
         
-        # Create predictions for missing games only
+        # Create predictions for missing games only using merged features
         trainer = GameModelTrainer(self.data_obj)
-        game_data = trainer.game_data
-        
         new_df = pd.DataFrame()
         all_targets = trainer.targets['regression'] + trainer.targets['classification']
         
         for target in all_targets:
+            # Load merged features for this target
+            merged = trainer._load_and_merge_features(target)
+            if merged is None or merged.empty:
+                logging.warning(f"No merged features found for {target}")
+                continue
+            
+            # Filter to only missing game_ids
+            merged_missing = merged[merged['game_id'].isin(missing_keys)].copy()
+            if merged_missing.empty:
+                logging.warning(f"No features found for missing games for target {target}")
+                continue
+            
             model = self.models.get(target)
             scaler = self.scalers.get(target)
             feature_names = self.model_feature_names.get(target)
@@ -804,33 +813,12 @@ class GamePredictor:
                 logging.warning(f"Missing model/scaler/feature_names for target {target}, skipping")
                 continue
             
-            # Build features for missing games
-            features_list = []
-            for key in missing_keys:
-                matching_games = game_data[game_data['key'] == key]
-                if matching_games.empty:
-                    continue
-                    
-                idx = matching_games.index[0]
-                features, _ = trainer._process_game_features(
-                    game_data=game_data,
-                    targets=[target],
-                    game_idx=idx
-                )
-                if features:
-                    features[0]['game_id'] = key
-                    features_list.append(features[0])
-            
-            if not features_list:
-                continue
-            
-            # Create DataFrame and make predictions
-            features_df = pd.DataFrame(features_list)
+            # Prepare features
+            source = merged_missing[['game_id', 'game_date', 'home_abbr', 'away_abbr']].copy()
+            key_cols = ['game_id', 'game_date', 'home_abbr', 'away_abbr']
+            X = merged_missing.drop(columns=key_cols + ['target'], errors='ignore')
             
             # Align to model's feature names
-            X_cols = [col for col in features_df.columns if col not in ['game_id', f'target_{target}']]
-            X = features_df[X_cols].copy()
-            
             missing_cols = [col for col in feature_names if col not in X.columns]
             if missing_cols:
                 missing_df = pd.DataFrame(0.0, index=X.index, columns=missing_cols)
@@ -859,52 +847,29 @@ class GamePredictor:
                     sample_key = next(iter(baselines.keys()))
                     if isinstance(sample_key, tuple):
                         # Time-varying baselines (team_abbr, game_date)
-                        # Need to get team_abbr and game_date for each game_id
-                        baseline_values = []
-                        for idx, row in features_df.iterrows():
-                            game_id = row['game_id']
-                            # Get team_abbr and game_date from boxscores
-                            if game_id in boxscores['key'].values:
-                                game_row = boxscores[boxscores['key'] == game_id].iloc[0]
-                                team_abbr = game_row[team_col]
-                                game_date = game_row['game_date']
-                                baseline_values.append(baselines.get((team_abbr, game_date), global_mean))
-                            else:
-                                baseline_values.append(global_mean)
-                        preds = preds + np.array(baseline_values)
+                        baseline_values = source.apply(
+                            lambda row: baselines.get((row[team_col], row['game_date']), global_mean),
+                            axis=1
+                        ).values
                     else:
                         # Static baselines (team_abbr only)
-                        # Get team_abbr from boxscores for each game_id
-                        baseline_values = []
-                        for game_id in features_df['game_id']:
-                            if game_id in boxscores['key'].values:
-                                team_abbr = boxscores[boxscores['key'] == game_id].iloc[0][team_col]
-                                baseline_values.append(baselines.get(team_abbr, global_mean))
-                            else:
-                                baseline_values.append(global_mean)
-                        preds = preds + np.array(baseline_values)
+                        baseline_values = source[team_col].map(baselines).fillna(global_mean).values
                     
+                    preds = preds + baseline_values
                     logging.info(f"Added baselines to residual predictions for {target}")
             
             # Build result DataFrame
-            result = features_df[['game_id']].copy()
-            result[f'predicted_{target}'] = preds
+            source[f'predicted_{target}'] = preds
             
             if new_df.empty:
-                new_df = result
+                new_df = source
             else:
-                new_df = new_df.merge(result, on='game_id', how='outer')
+                new_df = new_df.merge(source, on=['game_id', 'game_date', 'home_abbr', 'away_abbr'], how='outer')
             
             logging.info(f"Updated predictions for target {target}")
         
-        # Merge with boxscore metadata
+        # Combine with existing predictions
         if not new_df.empty:
-            new_df = new_df.merge(
-                boxscores[['key', 'game_date', 'home_abbr', 'away_abbr']].rename(columns={'key': 'game_id'}),
-                on='game_id',
-                how='left'
-            )
-            
             # Combine with existing predictions
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
             
@@ -937,12 +902,15 @@ if __name__ == "__main__":
     predictor.load_all_models()
     
     # Example: Predict all next games and save to file
-    predictions_df = predictor.predict_all_next_games(save_to_file=True, upload_to_s3=False)
+    # predictions_df = predictor.predict_all_next_games(save_to_file=True, upload_to_s3=False)
     
-    # # Example: Predict a single game
+    # # # Example: Predict a single game
     # single_game_predictions = predictor.predict_single_game('GNB')
     # if single_game_predictions:
     #     logging.info(f"Predictions: {single_game_predictions}")
     
     # Example: Create all past predictions from merged features
-    # past_predictions_df = predictor.create_all_past_predictions_from_merged(save_to_file=True, upload_to_s3=True)
+    # predictor.create_all_past_predictions_from_merged(save_to_file=True, upload_to_s3=True)
+
+    # Example: Update all past predictions
+    predictor.update_all_past_predictions(save_to_file=True, upload_to_s3=True)

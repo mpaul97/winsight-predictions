@@ -2080,9 +2080,14 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
     # Example usage
+    # data_obj = DataObject(
+    #     storage_mode='s3',
+    #     s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
+    # )
     data_obj = DataObject(
-        storage_mode='s3',
-        s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
+        league='nfl',
+        storage_mode='local',
+        local_root=os.path.join(sys.path[0], "..", "..", "..", "sports-data-storage-copy/")
     )
-    df = data_obj.previews
-    print(df)
+    df = data_obj.player_data
+    print(df[['week']])

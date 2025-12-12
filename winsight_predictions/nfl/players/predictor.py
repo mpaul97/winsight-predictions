@@ -85,6 +85,7 @@ class PlayerPredictor:
     data_obj: DataObject
     min_games: int = 2
     root_dir: str = "./"
+    predictions_bucket_name: str = 'LEAGUE_PREDICTIONS_BUCKET_NAME'
     
     # Internal caches (populated during __post_init__)
     models: Dict[str, Any] = field(default_factory=dict, init=False)
@@ -185,9 +186,9 @@ class PlayerPredictor:
         
         if self.data_obj.storage_mode == "s3":
             # Load models from S3
-            bucket_name = os.getenv("LEAGUE_PREDICTIONS_BUCKET_NAME")
+            bucket_name = os.getenv(self.predictions_bucket_name)
             if not bucket_name:
-                logging.error("LEAGUE_PREDICTIONS_BUCKET_NAME environment variable not set for S3 mode.")
+                logging.error(f"{self.predictions_bucket_name} environment variable not set for S3 mode.")
                 return
             
             s3_client = boto3.client('s3')
@@ -501,8 +502,8 @@ class PlayerPredictor:
         upcoming_row['position'] = position
         upcoming_row['starter'] = int(pid in self.data_obj.starters_new['player_id'].values)
         
-        # Check game is in future
-        if upcoming_row['game_date'] <= pd.Timestamp(datetime.now().date()):
+        # Check game is in future (with 1 day buffer)
+        if upcoming_row['game_date'] <= pd.Timestamp(datetime.now().date() - timedelta(days=1)):
             logging.warning(f"Game date {upcoming_row['game_date']} is not in the future")
             return None
         
@@ -559,7 +560,7 @@ class PlayerPredictor:
         save_results: bool = True,
         save_features: bool = True
     ) -> Optional[pd.DataFrame]:
-        """Predict for all starters in upcoming games.
+        """Predict for all starters in upcoming games using optimized batching and asyncio.
         
         Args:
             positions: Optional list of positions to predict. If None, predict all.
@@ -569,53 +570,102 @@ class PlayerPredictor:
         Returns:
             DataFrame with predictions or None if no predictions generated
         """
-        # Clear feature accumulator if saving features
         if save_features:
             self._feature_accumulator.clear()
-        
+
         starters = self.data_obj.starters_new
         if starters.empty:
             logging.warning("No starters data available")
             return None
-        
-        # Filter by positions if specified
+
+        # Add FLEX players
+        df = self.data_obj.player_data[['abbr', 'year', 'player_name', 'pos', 'pid', 'off_pct']]
+        season = df['year'].max()
+        df = df[(df['year'] == season) & (df['pos'].isin(['RB', 'WR', 'TE']))]
+        df = df.groupby(['abbr', 'year', 'player_name', 'pos', 'pid']).filter(lambda x: x['off_pct'].mean() > 0.4)
+        df = df[['abbr', 'player_name', 'pos', 'pid']].reset_index(drop=True).drop_duplicates(subset=['pid'])
+        df = df.rename(columns={'abbr': 'team_abbr', 'pid': 'player_id', 'pos': 'position'})
+        starters = pd.concat([starters, df], ignore_index=True).drop_duplicates(subset=['player_id'])
+
         if positions:
             starters = starters[starters['position'].isin(positions)]
-        
-        all_predictions = []
-        for _, row in tqdm(starters.iterrows(), total=len(starters), desc="Predicting players"):
-            pid = row['player_id']
-            position = row['position']
-            
-            predictions = self.predict_single_player(
-                pid=pid, 
-                position=position, 
-                accumulate_features=save_features
-            )
-            if predictions:
-                all_predictions.append(predictions)
-        
+
+        # Run predictions asynchronously
+        loop = asyncio.get_event_loop()
+        all_predictions = loop.run_until_complete(
+            self._run_predictions_async(starters, save_features)
+        )
+
         if not all_predictions:
             logging.warning("No predictions generated")
             return None
-        
+
         df = pd.DataFrame(all_predictions)
         logging.info(f"Generated predictions for {len(df)} players")
-        
+
         if save_results:
-            local_predictions_dir = './player_predictions/'
-            os.makedirs(local_predictions_dir, exist_ok=True)
-            df = df[['pid', 'player_name', 'position', 'team_abbr'] + [col for col in df.columns if col not in ['pid', 'player_name', 'position', 'team_abbr']]]
-            for position, group_df in df.groupby('position'):
-                filepath = os.path.join(local_predictions_dir, f'{position}_next_player_predictions.csv')
-                group_df.sort_values(by=['fantasy_points'], ascending=False).round(2).to_csv(filepath, index=False)
-                logging.info(f"Saved predictions to {filepath}")
+            self._save_predictions(df)
         
-        # Save feature groupings if requested
         if save_features and self._feature_accumulator:
             self._save_feature_groupings()
-        
+
         return df
+
+    async def _run_predictions_async(self, starters: pd.DataFrame, save_features: bool) -> List[Dict]:
+        """Helper to run player predictions asynchronously."""
+        tasks = []
+        sem = asyncio.Semaphore(10)  # Limit concurrency
+
+        for _, row in starters.iterrows():
+            task = asyncio.create_task(
+                self.predict_single_player_async(
+                    pid=row['player_id'],
+                    position=row['position'],
+                    accumulate_features=save_features,
+                    semaphore=sem
+                )
+            )
+            tasks.append(task)
+
+        results = await asyncio.gather(*tasks)
+        return [res for res in results if res is not None]
+
+    async def predict_single_player_async(
+        self,
+        pid: str,
+        position: str,
+        target_subset: Optional[List[str]] = None,
+        accumulate_features: bool = False,
+        semaphore: Optional[Semaphore] = None
+    ) -> Optional[Dict[str, float]]:
+        """Asynchronous version of predict_single_player."""
+        async with semaphore:
+            return await asyncio.to_thread(
+                self.predict_single_player,
+                pid=pid,
+                position=position,
+                target_subset=target_subset,
+                accumulate_features=accumulate_features
+            )
+
+    def _save_predictions(self, df: pd.DataFrame):
+        """Save prediction results to CSV files, grouped by position."""
+        local_predictions_dir = './player_predictions/'
+        os.makedirs(local_predictions_dir, exist_ok=True)
+        
+        # Ensure required columns are first
+        cols_to_front = ['pid', 'player_name', 'position', 'team_abbr']
+        other_cols = [col for col in df.columns if col not in cols_to_front]
+        df = df[cols_to_front + other_cols]
+
+        for position, group_df in df.groupby('position'):
+            filepath = os.path.join(local_predictions_dir, f'{position}_next_player_predictions.csv')
+            
+            # Sort by fantasy_points if it exists
+            sort_col = 'fantasy_points' if 'fantasy_points' in group_df.columns else 'pid'
+            
+            group_df.sort_values(by=[sort_col], ascending=False).round(2).to_csv(filepath, index=False)
+            logging.info(f"Saved predictions to {filepath}")
     
     def _save_feature_groupings(self) -> None:
         """Save accumulated feature groupings to CSV files (trainer format)."""
@@ -643,7 +693,10 @@ if __name__ == "__main__":
     #     s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
     # )
     
-    predictor = PlayerPredictor(data_obj=data_obj)
+    predictor = PlayerPredictor(
+        data_obj=data_obj,
+        root_dir="./"
+    )
     
     # Example 1: Predict for a single player (all targets)
     # predictor.predict_single_player(pid='ChasJa00', position='WR', show=True)

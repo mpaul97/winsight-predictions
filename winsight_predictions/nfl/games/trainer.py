@@ -686,6 +686,10 @@ class GameModelTrainer:
         correlations = X.corrwith(y).abs().sort_values(ascending=False)
         logging.info(f"Top 10 feature correlations with target:\n{correlations.head(10)}")
         
+        # cast if is_classification
+        if is_classification:
+            y = y.astype(int)
+
         # Train/test split
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         
