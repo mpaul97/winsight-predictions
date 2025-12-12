@@ -17,5 +17,8 @@ prune winsight_predictions/nfl/players/features
 prune winsight_predictions/nfl/players/player_predictions
 prune winsight_predictions/nfl/players/predicted_features
 prune winsight_predictions/nfl/players/train
+prune tests
+prune .vscode
+prune .pytest_cache
 global-exclude __pycache__
 global-exclude *.py[co]

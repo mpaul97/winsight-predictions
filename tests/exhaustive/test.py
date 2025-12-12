@@ -11,7 +11,7 @@ if __name__ == "__main__":
     data_obj = DataObject(
         league='nfl',
         storage_mode='s3',
-        s3_bucket=os.getenv("LEAGUE_PREDICTIONS_BUCKET_NAME")
+        s3_bucket=os.getenv("SPORTS_DATA_BUCKET_NAME")
     )
     
     predictor = PlayerPredictor(data_obj=data_obj)
