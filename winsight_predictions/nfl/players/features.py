@@ -341,28 +341,34 @@ class FeatureEngine:
 	def _load_game_targets_features(self) -> Dict[str, Any]:
 		row = self.row
 		is_home = row['is_home']
-		src_df = self.game_predictions.copy().rename(columns={'game_id':'key'})
+		src_df = self.game_predictions.copy().rename(columns={ 'game_id':'key' })
 		features: Dict[str, Any] = {}
 		game_targets_regression = ['points', 'total_yards', 'pass_yards', 'rush_yards', 'pass_attempts', 'rush_attempts']
 		game_targets_classification = ['win']
-		if src_df is not None and not src_df.empty:
-			preds_row = src_df[src_df['key'] == row['key']].iloc[0].to_dict()
-			if is_home == 1:
-				for t in game_targets_regression:
-					features[f'team_game_{t}'] = preds_row.get(f'predicted_home_{t}', preds_row.get(f'home_{t}', np.nan))
-					features[f'opp_game_{t}'] = preds_row.get(f'predicted_away_{t}', preds_row.get(f'away_{t}', np.nan))
-				features['team_game_win'] = preds_row.get('predicted_home_win', preds_row.get(f'home_win', np.nan))
-				features['opp_game_win'] = preds_row.get('predicted_away_win', 1 - preds_row.get(f'home_win', np.nan))
+		try:
+			if src_df is not None and not src_df.empty:
+				preds_row = src_df[src_df['key'] == row['key']].iloc[0].to_dict()
+				if is_home == 1:
+					for t in game_targets_regression:
+						features[f'team_game_{t}'] = preds_row.get(f'predicted_home_{t}', preds_row.get(f'home_{t}', np.nan))
+						features[f'opp_game_{t}'] = preds_row.get(f'predicted_away_{t}', preds_row.get(f'away_{t}', np.nan))
+					features['team_game_win'] = preds_row.get('predicted_home_win', preds_row.get(f'home_win', np.nan))
+					features['opp_game_win'] = preds_row.get('predicted_away_win', 1 - preds_row.get(f'home_win', np.nan))
+				else:
+					for t in game_targets_regression:
+						features[f'team_game_{t}'] = preds_row.get(f'predicted_away_{t}', preds_row.get(f'away_{t}', np.nan))
+						features[f'opp_game_{t}'] = preds_row.get(f'predicted_home_{t}', preds_row.get(f'home_{t}', np.nan))
+					features['team_game_win'] = preds_row.get('predicted_away_win', 1 - preds_row.get(f'home_win', np.nan))
+					features['opp_game_win'] = preds_row.get('predicted_home_win', preds_row.get(f'home_win', np.nan))
 			else:
-				for t in game_targets_regression:
-					features[f'team_game_{t}'] = preds_row.get(f'predicted_away_{t}', preds_row.get(f'away_{t}', np.nan))
-					features[f'opp_game_{t}'] = preds_row.get(f'predicted_home_{t}', preds_row.get(f'home_{t}', np.nan))
-				features['team_game_win'] = preds_row.get('predicted_away_win', 1 - preds_row.get(f'home_win', np.nan))
-				features['opp_game_win'] = preds_row.get('predicted_home_win', preds_row.get(f'home_win', np.nan))
-		else:
+				for t in game_targets_regression + game_targets_classification:
+					features[f'team_game_{t}'] = row.get(f'team_game_{t}', np.nan)
+					features[f'opp_game_{t}'] = row.get(f'opp_game_{t}', np.nan)
+		except Exception as e:
+			logging.warning(f"Error loading game target features for row {row.get('key', 'unknown')}: {e}")
 			for t in game_targets_regression + game_targets_classification:
-				features[f'team_game_{t}'] = row.get(f'team_game_{t}', np.nan)
-				features[f'opp_game_{t}'] = row.get(f'opp_game_{t}', np.nan)
+				features[f'team_game_{t}'] = np.nan
+				features[f'opp_game_{t}'] = np.nan
 		return features
 
 	# ========== Property wrappers ==========

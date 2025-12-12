@@ -982,10 +982,66 @@ class FeatureEngine:
                 features['temperature'] = 72.0
                 features['humidity'] = 50.0
                 features['wind_speed'] = 0.0
+                features['is_indoor'] = 1
         else:
             features['temperature'] = 72.0
             features['humidity'] = 50.0
             features['wind_speed'] = 0.0
+            features['is_indoor'] = 1
+        
+        # Add categorical weather features based on thresholds
+        temp = features['temperature']
+        humidity = features['humidity']
+        wind = features['wind_speed']
+        
+        # Temperature categories
+        features['is_very_cold'] = 1 if temp < 32 else 0  # Freezing
+        features['is_cold'] = 1 if temp < 45 else 0
+        features['is_mild'] = 1 if 45 <= temp <= 75 else 0
+        features['is_hot'] = 1 if temp > 85 else 0
+        features['is_very_hot'] = 1 if temp > 95 else 0
+        
+        # Wind categories
+        features['is_windy'] = 1 if wind > 10 else 0
+        features['is_very_windy'] = 1 if wind > 15 else 0
+        features['is_extremely_windy'] = 1 if wind > 20 else 0
+        
+        # Humidity categories
+        features['is_humid'] = 1 if humidity > 70 else 0
+        features['is_very_humid'] = 1 if humidity > 85 else 0
+        features['is_dry'] = 1 if humidity < 30 else 0
+        
+        # Infer weather conditions from numeric values
+        # Snow: Very cold + high humidity
+        features['is_snowy'] = 1 if temp < 35 and humidity > 70 else 0
+        
+        # Rain: Cold to warm + very high humidity
+        features['is_rainy'] = 1 if temp >= 35 and humidity > 85 else 0
+        
+        # Fog: High humidity + mild temps + low wind
+        features['is_foggy'] = 1 if humidity > 80 and 40 <= temp <= 70 and wind < 5 else 0
+        
+        # Cloudy: Moderate to high humidity, not extreme
+        features['is_cloudy'] = 1 if 50 < humidity <= 80 and not features['is_snowy'] and not features['is_rainy'] else 0
+        
+        # Clear: Low humidity and not other conditions
+        features['is_clear'] = 1 if humidity < 50 and not features['is_snowy'] and not features['is_rainy'] and not features['is_foggy'] else 0
+        
+        # Composite extreme weather indicators
+        features['is_extreme_weather'] = 1 if (
+            features['is_very_cold'] or 
+            features['is_very_hot'] or 
+            features['is_extremely_windy'] or 
+            features['is_snowy'] or 
+            (features['is_rainy'] and features['is_windy'])
+        ) else 0
+        
+        features['is_ideal_weather'] = 1 if (
+            features['is_mild'] and 
+            not features['is_windy'] and 
+            not features['is_rainy'] and 
+            not features['is_snowy']
+        ) else 0
         
         return features
 

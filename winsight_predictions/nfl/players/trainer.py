@@ -9,7 +9,7 @@ import joblib
 import json
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.model_selection import train_test_split
@@ -43,9 +43,14 @@ logging.basicConfig(level=logging.INFO)
 
 class PlayerModelTrainer:
 
-    def __init__(self, data_obj: DataObject):
+    def __init__(self, data_obj: DataObject, use_residual_training: bool = False):
         self.data_obj = data_obj
         self.min_games = 2
+        self.use_residual_training = use_residual_training
+        
+        # Residual training attributes
+        self.global_mean = None
+        self.player_baselines = None
 
         self.features_dir = "./features/"
         self.models_dir = "./models/"
@@ -124,6 +129,22 @@ class PlayerModelTrainer:
                 'over_under_receptions_5+', 'over_under_receiving_yards_60+', 'over_under_receiving_touchdowns_1+'
             ]
         }
+
+        self.classification_targets = [
+            'over_under_attempted_passes_34+',
+            'over_under_completed_passes_22+',
+            'over_under_passing_yards_250+',
+            'over_under_passing_touchdowns_2+',
+            'over_under_interceptions_thrown_1+',
+            'over_under_rush_attempts_16+',
+            'over_under_rush_yards_60+',
+            'over_under_rush_touchdowns_1+',
+            'over_under_receptions_5+',
+            'over_under_receiving_yards_60+',
+            'over_under_receiving_touchdowns_1+',
+            'over_under_rush_yards_&_receiving_yards_100+',
+            'over_under_rush_touchdowns_&_receiving_touchdowns_1+',
+        ]
 
         self.player_data = self.data_obj.player_data
 
@@ -507,41 +528,127 @@ class PlayerModelTrainer:
         
         return X
 
-    def _save_model_metrics(self, position: str, target: str, metrics: dict):
-        """Save model metrics to model_metrics.json file.
+    def _compute_player_baselines(self, df: pd.DataFrame, target_col: str, prior_weight: int = 5, window: int = 15, use_rolling: bool = True, normal_window_mean: bool = False) -> None:
+        """Compute player-level shrinkage baselines using rolling window or total mean.
         
         Args:
-            position: Player position
-            target: Target variable
-            metrics: Dictionary containing model metrics
+            df: DataFrame containing pid, game_date, and target column
+            target_col: Name of the target column
+            prior_weight: Weight for global mean in shrinkage estimation
+            rolling_window: Number of recent games to use for baseline (default: 15, only used if use_rolling=True)
+            use_rolling: If True, uses rolling window mean. If False, uses total career mean per player
         """
-        metrics_file = os.path.join(self.models_dir, "model_metrics.json")
+        self.global_mean = df[target_col].mean()
         
-        # Load existing metrics if file exists
-        if os.path.exists(metrics_file):
-            with open(metrics_file, 'r') as f:
-                all_metrics = json.load(f)
-        else:
-            all_metrics = {}
+        # Sort by player and date to ensure chronological order
+        df_sorted = df.sort_values(['pid', 'game_date']).copy()
         
-        # Add new metrics with position_target key
-        model_key = f"{position}_{target}"
-        all_metrics[model_key] = metrics
+        if use_rolling:
+            # Compute rolling mean for each player
+            df_sorted['rolling_mean'] = (
+                df_sorted.fillna(0.0).groupby('pid')[target_col]
+                .transform(lambda x: x.rolling(window=window, min_periods=3).mean())
+            )
+            df_sorted['rolling_count'] = (
+                df_sorted.fillna(0.0).groupby('pid')[target_col]
+                .transform(lambda x: x.rolling(window=window, min_periods=3).count())
+            )
+            
+            # Apply shrinkage: blend rolling mean with global mean
+            df_sorted['baseline'] = (
+                df_sorted['rolling_mean'] * df_sorted['rolling_count'] + 
+                self.global_mean * prior_weight
+            ) / (df_sorted['rolling_count'] + prior_weight)
+            
+            # Fill NaN with global mean (for players with < min_periods games)
+            df_sorted['baseline'] = df_sorted['baseline'].fillna(self.global_mean)
+            
+            # Create baseline dictionary keyed by (pid, game_date)
+            # This allows time-varying baselines
+            self.player_baselines = df_sorted.set_index(['pid', 'game_date'])['baseline'].to_dict()
+            
+            logging.info(f"Computed rolling player baselines (window={window}) - "
+                        f"Global mean: {self.global_mean:.4f}, "
+                        f"Unique player-game baselines: {len(self.player_baselines)}")
+        elif normal_window_mean:
         
-        # Sort by R2 score (best models first)
-        sorted_metrics = dict(sorted(
-            all_metrics.items(),
-            key=lambda x: x[1].get('r2_score', 0),
-            reverse=True
-        ))
-        
-        # Save back to file
-        with open(metrics_file, 'w') as f:
-            json.dump(sorted_metrics, f, indent=2)
-        
-        logging.info(f"Saved metrics for {model_key} to {metrics_file}")
+            baselines = []
+    
+            for pid, group in df_sorted.groupby('pid'):
+                group = group.sort_values('game_date').reset_index(drop=True)
+                
+                for idx in range(len(group)):
+                    # Get last N games (not including current game)
+                    if idx == 0:
+                        # First game - use global mean
+                        baseline = self.global_mean
+                    else:
+                        # Get previous games (up to last N)
+                        start_idx = max(0, idx - window)
+                        last_n = group.iloc[start_idx:idx][target_col].dropna()
+                        
+                        if len(last_n) == 0:
+                            baseline = self.global_mean
+                        else:
+                            # Simple mean with shrinkage
+                            player_mean = last_n.mean()
+                            count = len(last_n)
+                            baseline = (player_mean * count + self.global_mean * prior_weight) / (count + prior_weight)
+                    
+                    baselines.append({
+                        'pid': pid,
+                        'game_date': group.iloc[idx]['game_date'],
+                        'baseline': baseline
+                    })
+    
+            # Convert to dictionary
+            baselines_df = pd.DataFrame(baselines)
+            self.player_baselines = baselines_df.set_index(['pid', 'game_date'])['baseline'].to_dict()
 
-    def _train_and_evaluate_model(self, X: pd.DataFrame, y: pd.Series, position: str, target: str):
+        else:
+            # Compute total career mean for each player
+            player_stats = df.groupby("pid")[target_col].agg(["mean", "count"])
+            player_stats["baseline"] = (
+                player_stats["mean"] * player_stats["count"] + self.global_mean * prior_weight
+            ) / (player_stats["count"] + prior_weight)
+            self.player_baselines = player_stats["baseline"].to_dict()
+            
+            logging.info(f"Computed total career player baselines - "
+                        f"Global mean: {self.global_mean:.4f}, "
+                        f"Unique players: {len(self.player_baselines)}")
+        return
+
+    def _compute_player_baselines_ewm(self, df: pd.DataFrame, target_col: str, prior_weight: int = 3, span: int = 20) -> None:
+        """Compute player baselines using exponentially weighted moving average.
+        
+        Args:
+            span: Controls decay rate (higher = more history, lower = more recent emphasis)
+        """
+        self.global_mean = df[target_col].mean()
+        
+        df_sorted = df.sort_values(['pid', 'game_date']).copy()
+        
+        # Compute EWM for each player (more weight on recent games)
+        df_sorted['ewm_mean'] = (
+            df_sorted.groupby('pid')[target_col]
+            .transform(lambda x: x.ewm(span=span, min_periods=3).mean())
+        )
+        
+        # Apply shrinkage to global mean
+        effective_count = span  # Approximate effective sample size for EWM
+        df_sorted['baseline'] = (
+            df_sorted['ewm_mean'] * effective_count + self.global_mean * prior_weight
+        ) / (effective_count + prior_weight)
+        
+        df_sorted['baseline'] = df_sorted['baseline'].fillna(self.global_mean)
+        
+        self.player_baselines = df_sorted.set_index(['pid', 'game_date'])['baseline'].to_dict()
+        
+        logging.info(f"Computed EWM player baselines (span={span}) - "
+                    f"Global mean: {self.global_mean:.4f}")
+        return
+
+    def _train_and_evaluate_model(self, X: pd.DataFrame, y: pd.Series, position: str, target: str, df_with_pid: pd.DataFrame = None):
         """Train and evaluate a model for the given features and target.
         
         Args:
@@ -549,8 +656,42 @@ class PlayerModelTrainer:
             y: Target Series
             position: Player position
             target: Target variable
+            df_with_pid: Original DataFrame with 'pid' column (required for residual training)
         """
         logging.info(f"Final feature shape for modeling: {X.shape}")
+        
+        # Handle residual target training for non-classification targets
+        is_classification = target in self.classification_targets
+        use_residuals = self.use_residual_training and not is_classification
+        
+        if use_residuals:
+            if df_with_pid is None or 'pid' not in df_with_pid.columns:
+                logging.warning(f"Residual training enabled but no pid column available. Falling back to regular training.")
+                use_residuals = False
+            else:
+                logging.info(f"Using residual target training for {target}")
+                # Compute player baselines with exponentially weighted moving average
+                self._compute_player_baselines_ewm(df_with_pid, 'target', prior_weight=1, span=10)
+                
+                # Add player baseline (handle both time-varying and static baselines)
+                if isinstance(self.player_baselines, dict):
+                    # Check if it's time-varying (tuple keys) or static (string keys)
+                    sample_key = next(iter(self.player_baselines.keys()))
+                    if isinstance(sample_key, tuple):
+                        # Time-varying baselines (pid, game_date)
+                        df_with_pid['player_baseline'] = df_with_pid.apply(
+                            lambda row: self.player_baselines.get((row['pid'], row['game_date']), self.global_mean),
+                            axis=1
+                        )
+                    else:
+                        # Static baselines (pid only)
+                        df_with_pid['player_baseline'] = df_with_pid['pid'].map(self.player_baselines).fillna(self.global_mean)
+                
+                df_with_pid['residual_target'] = df_with_pid['target'] - df_with_pid['player_baseline']
+                
+                # Use residual target for training
+                y = df_with_pid['residual_target'].copy().fillna(0.0)
+                logging.info(f"Residual target stats - Mean: {y.mean():.4f}, Std: {y.std():.4f}, Min: {y.min():.4f}, Max: {y.max():.4f}")
         
         # Log top correlations
         correlations = X.corrwith(y).abs().sort_values(ascending=False)
@@ -566,16 +707,28 @@ class PlayerModelTrainer:
         
         # Train model
         logging.info("Training model...")
-        model = HistGradientBoostingRegressor(random_state=42, max_iter=100)
+        if target in self.classification_targets:
+            model = HistGradientBoostingClassifier()
+        else:
+            model = HistGradientBoostingRegressor(
+                learning_rate=0.03,
+                max_iter=1200,
+                max_depth=6,
+                early_stopping=True,
+                n_iter_no_change=20,
+                l2_regularization=0.5,
+                random_state=42
+            )
         model.fit(X_train_scaled, y_train)
         
         # Evaluate
         y_pred = model.predict(X_test_scaled)
+        sk_score = model.score(X_test_scaled, y_test)
         mse = mean_squared_error(y_test, y_pred)
         rmse = np.sqrt(mse)
         r2 = r2_score(y_test, y_pred)
         mae = mean_absolute_error(y_test, y_pred)
-        logging.info(f"Model performance for Position: {position}, Target: {target} -- MSE: {mse:.4f}, RMSE: {rmse:.4f}, R2: {r2:.4f}, MAE: {mae:.4f}")
+        logging.info(f"Model performance for Position: {position}, Target: {target} -- MSE: {mse:.4f}, RMSE: {rmse:.4f}, R2: {r2:.4f}, MAE: {mae:.4f}, Score: {sk_score:.4f}")
         
         # Prepare metrics for JSON
         top_10_features = [
@@ -588,6 +741,7 @@ class PlayerModelTrainer:
         ]
         
         metrics = {
+            "score": float(sk_score),
             "mean_squared_error": float(mse),
             "root_mean_squared_error": float(rmse),
             "mean_absolute_error": float(mae),
@@ -613,11 +767,54 @@ class PlayerModelTrainer:
             'feature_names': list(X.columns)
         }
         
+        # Add residual training baseline data if used
+        if use_residuals:
+            model_bundle['global_mean'] = self.global_mean
+            model_bundle['player_baselines'] = self.player_baselines
+            model_bundle['use_residual_training'] = True
+            logging.info(f"Saved residual training baseline data (global_mean, player_baselines) to model bundle")
+        else:
+            model_bundle['use_residual_training'] = False
+        
         joblib.dump(model_bundle, model_path)
         logging.info(f"Saved model bundle (model, scaler, feature_names) to {model_path}")
         
         # Clean up memory
         del X_train, X_test, X_train_scaled, X_test_scaled
+
+    def _save_model_metrics(self, position: str, target: str, metrics: dict):
+        """Save model metrics to model_metrics.json file.
+        
+        Args:
+            position: Player position
+            target: Target variable
+            metrics: Dictionary containing model metrics
+        """
+        metrics_file = os.path.join(self.models_dir, "model_metrics.json")
+        
+        # Load existing metrics if file exists
+        if os.path.exists(metrics_file):
+            with open(metrics_file, 'r') as f:
+                all_metrics = json.load(f)
+        else:
+            all_metrics = {}
+        
+        # Add new metrics with position_target key
+        model_key = f"{position}_{target}"
+        all_metrics[model_key] = metrics
+        
+        # Sort by R2 score (best models first)
+        sorted_metrics = dict(sorted(
+            all_metrics.items(),
+            key=lambda x: x[1].get('score', 0),
+            reverse=True
+        ))
+        
+        # Save back to file
+        with open(metrics_file, 'w') as f:
+            json.dump(sorted_metrics, f, indent=2)
+        
+        logging.info(f"Saved metrics for {model_key} to {metrics_file}")
 
     def train_models(self, max_features: int = 3000):
         """Load feature groupings and train models with memory-efficient approach.
@@ -642,8 +839,8 @@ class PlayerModelTrainer:
                 # Perform feature selection
                 X = self._select_features(X, y, max_features)
                 
-                # Train and evaluate model
-                self._train_and_evaluate_model(X, y, position, target)
+                # Train and evaluate model (pass df with pid for residual training)
+                self._train_and_evaluate_model(X, y, position, target, df_with_pid=df[['pid', 'game_date', 'target']].copy())
                 
                 # Clean up memory
                 del df, X, y
@@ -677,12 +874,13 @@ if __name__ == "__main__":
         storage_mode='local',
         local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
     )
-    trainer = PlayerModelTrainer(data_obj)
-    # trainer.create_feature_groupings(position='TE')
+    trainer = PlayerModelTrainer(data_obj, use_residual_training=True)
+
+    # trainer.create_feature_groupings(position='QB')
     
     # Example for debugging a single player
     # fe_instance = trainer.debug_feature_grouping(pid='LoveJo03', position='QB', target='passing_yards')
 
-    # trainer.train_models()
+    trainer.train_models()
 
-    trainer.upload_models_to_s3()
+    # trainer.upload_models_to_s3()

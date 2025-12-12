@@ -93,6 +93,11 @@ class PlayerPredictor:
     model_dir: str = field(default="", init=False)
     features_dir: str = field(default="", init=False)
     
+    # Residual training metadata
+    global_means: Dict[str, float] = field(default_factory=dict, init=False)
+    player_baselines: Dict[str, Dict[str, float]] = field(default_factory=dict, init=False)
+    use_residual_training: Dict[str, bool] = field(default_factory=dict, init=False)
+    
     # Cached data
     _player_data: pd.DataFrame = field(default=None, init=False)
     _upcoming_games: pd.DataFrame = field(default=None, init=False)
@@ -119,6 +124,22 @@ class PlayerPredictor:
         'over_under_rush_yards_&_receiving_yards_100+': 4,
         'over_under_rush_touchdowns_&_receiving_touchdowns_1+': 4,
     }, init=False)
+
+    _classification_targets: List[str] = field(default_factory=lambda: [
+        'over_under_attempted_passes_34+',
+        'over_under_completed_passes_22+',
+        'over_under_passing_yards_250+',
+        'over_under_passing_touchdowns_2+',
+        'over_under_interceptions_thrown_1+',
+        'over_under_rush_attempts_16+',
+        'over_under_rush_yards_60+',
+        'over_under_rush_touchdowns_1+',
+        'over_under_receptions_5+',
+        'over_under_receiving_yards_60+',
+        'over_under_receiving_touchdowns_1+',
+        'over_under_rush_yards_&_receiving_yards_100+',
+        'over_under_rush_touchdowns_&_receiving_touchdowns_1+',
+    ])
 
     def __post_init__(self):
         self.model_dir = os.path.join(self.root_dir, "models")
@@ -199,9 +220,15 @@ class PlayerPredictor:
                                         self.models[model_key] = model_bundle.get('model')
                                         self.scalers[model_key] = model_bundle.get('scaler')
                                         self.model_feature_names[model_key] = model_bundle.get('feature_names', [])
+                                        # Extract residual training metadata
+                                        self.use_residual_training[model_key] = model_bundle.get('use_residual_training', False)
+                                        if self.use_residual_training[model_key]:
+                                            self.global_means[model_key] = model_bundle.get('global_mean', 0.0)
+                                            self.player_baselines[model_key] = model_bundle.get('player_baselines', {})
                                         count += 1
                                     else:
                                         self.models[model_key] = model_bundle
+                                        self.use_residual_training[model_key] = False
                                         count += 1
             except Exception as e:
                 logging.error(f"Failed listing S3 models: {e}")
@@ -229,9 +256,15 @@ class PlayerPredictor:
                                 self.models[model_key] = model_bundle.get('model')
                                 self.scalers[model_key] = model_bundle.get('scaler')
                                 self.model_feature_names[model_key] = model_bundle.get('feature_names', [])
+                                # Extract residual training metadata
+                                self.use_residual_training[model_key] = model_bundle.get('use_residual_training', False)
+                                if self.use_residual_training[model_key]:
+                                    self.global_means[model_key] = model_bundle.get('global_mean', 0.0)
+                                    self.player_baselines[model_key] = model_bundle.get('player_baselines', {})
                                 count += 1
                             else:
                                 self.models[model_key] = model_bundle
+                                self.use_residual_training[model_key] = False
                                 count += 1
                         except Exception as e:
                             logging.warning(f"Failed loading {model_path}: {e}")
@@ -373,7 +406,48 @@ class PlayerPredictor:
         else:
             X_pred_scaled = X_pred.values
         
-        return float(model.predict(X_pred_scaled)[0])
+        prediction = float(model.predict(X_pred_scaled)[0])
+        
+        # Denormalize residual prediction if model was trained with residuals
+        if self.use_residual_training.get(model_key, False):
+            pid = upcoming_row['pid']
+            game_date = upcoming_row['game_date']
+            player_baseline_dict = self.player_baselines.get(model_key, {})
+            global_mean = self.global_means.get(model_key, 0.0)
+            
+            # Check if baseline dict uses time-varying (tuple) or static (string) keys
+            if player_baseline_dict:
+                sample_key = next(iter(player_baseline_dict.keys()))
+                if isinstance(sample_key, tuple):
+                    # Time-varying baselines (e.g., EWM): find most recent baseline for player
+                    # Since upcoming game_date is new, get the last available baseline
+                    player_baselines_filtered = {
+                        (p, date): val 
+                        for (p, date), val in player_baseline_dict.items() 
+                        if p == pid
+                    }
+                    
+                    if player_baselines_filtered:
+                        # Get the most recent baseline (max date)
+                        most_recent_key = max(player_baselines_filtered.keys(), key=lambda x: x[1])
+                        player_baseline = player_baselines_filtered[most_recent_key]
+                    else:
+                        # Player not in training data, use global mean
+                        player_baseline = global_mean
+                else:
+                    # Static baselines (e.g., career mean): use pid key
+                    player_baseline = player_baseline_dict.get(pid, global_mean)
+            else:
+                player_baseline = global_mean
+
+            # Denormalize: actual_prediction = residual_prediction + player_baseline
+            prediction = prediction + player_baseline
+            
+            logging.debug(f"Denormalized residual prediction for {pid} {target}: "
+                         f"residual={prediction - player_baseline:.2f}, baseline={player_baseline:.2f}, "
+                         f"final={prediction:.2f}")
+        
+        return prediction
     
     def predict_single_player(
         self, 
@@ -532,11 +606,10 @@ class PlayerPredictor:
             local_predictions_dir = './player_predictions/'
             os.makedirs(local_predictions_dir, exist_ok=True)
             df = df[['pid', 'player_name', 'position', 'team_abbr'] + [col for col in df.columns if col not in ['pid', 'player_name', 'position', 'team_abbr']]]
-            df.sort_values(by=['fantasy_points'], ascending=False).round(2).to_csv(
-                os.path.join(local_predictions_dir, 'next_player_predictions.csv'), 
-                index=False
-            )
-            logging.info(f"Saved predictions to {local_predictions_dir}next_player_predictions.csv")
+            for position, group_df in df.groupby('position'):
+                filepath = os.path.join(local_predictions_dir, f'{position}_next_player_predictions.csv')
+                group_df.sort_values(by=['fantasy_points'], ascending=False).round(2).to_csv(filepath, index=False)
+                logging.info(f"Saved predictions to {filepath}")
         
         # Save feature groupings if requested
         if save_features and self._feature_accumulator:
@@ -573,11 +646,9 @@ if __name__ == "__main__":
     predictor = PlayerPredictor(data_obj=data_obj)
     
     # Example 1: Predict for a single player (all targets)
+    # predictor.predict_single_player(pid='ChasJa00', position='WR', show=True)
     # predictor.predict_single_player(pid='LoveJo03', position='QB', show=True)
     
     # Example 2: Predict for all starters
     predictor.predict_next_players()
-    
-    # Example 3: Predict for specific positions and save feature groupings (like trainer)
-    # predictor.predict_next_players(positions=['QB', 'RB'], save_results=True, save_features=True)
 
