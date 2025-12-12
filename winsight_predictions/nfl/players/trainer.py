@@ -881,6 +881,6 @@ if __name__ == "__main__":
     # Example for debugging a single player
     # fe_instance = trainer.debug_feature_grouping(pid='LoveJo03', position='QB', target='passing_yards')
 
-    trainer.train_models()
+    # trainer.train_models()
 
     # trainer.upload_models_to_s3()

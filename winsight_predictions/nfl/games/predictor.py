@@ -13,6 +13,7 @@ from tqdm import tqdm
 import sys
 from dotenv import load_dotenv
 from datetime import datetime
+from io import BytesIO
 
 load_dotenv()
 
@@ -39,7 +40,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 @dataclass
 class GamePredictor:
     data_obj: DataObject
-    models: Dict[str, Any]  # key: target -> fitted model
+    models: Dict[str, Any] = field(default_factory=dict) # key: target -> fitted model
     min_games: int = 3
     root_dir: str = "./"
     model_dir: str = field(default="")  # Will be set in __post_init__
@@ -50,6 +51,7 @@ class GamePredictor:
     use_residual_training: Dict[str, bool] = field(default_factory=dict)  # whether model uses residual training
     global_means: Dict[str, float] = field(default_factory=dict)  # global mean for residual models
     team_baselines: Dict[str, Dict] = field(default_factory=dict)  # team baselines for residual models
+    predictions_bucket_name: str = 'LEAGUE_PREDICTIONS_BUCKET_NAME'
 
     # Target classification (matching FeatureEngine structure)
     base_volume_stats: List[str] = field(default_factory=lambda: [
@@ -96,6 +98,8 @@ class GamePredictor:
         
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.features_dir, exist_ok=True)
+
+        self.load_all_models()
         
         # CRITICAL: Force DataObject to load game data and populate PBP column lists
         # This must happen BEFORE caching column lists in _fe_common_params
@@ -137,28 +141,24 @@ class GamePredictor:
             'available_positions': self._available_positions,
         }
 
-    def _load_model_from_s3(self, bucket_name: str, s3_key: str, s3_client) -> Optional[Any]:
-        """Load a single model bundle from S3.
+    def _load_model_from_s3(self, bucket: str, s3_key: str, s3_client) -> Optional[Any]:
+        """Load a model file from S3.
         
         Args:
-            bucket_name: S3 bucket name
+            bucket: S3 bucket name
             s3_key: S3 object key
             s3_client: boto3 S3 client
             
         Returns:
-            Model bundle or None if loading fails
+            Loaded model object or None if failed
         """
         try:
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_file:
-                tmp_path = tmp_file.name
-                s3_client.download_file(bucket_name, s3_key, tmp_path)
-                model_bundle = joblib.load(tmp_path)
-                os.unlink(tmp_path)
-                logging.info(f"Loaded model from S3: {s3_key}")
-                return model_bundle
+            response = s3_client.get_object(Bucket=bucket, Key=s3_key)
+            model_bytes = response['Body'].read()
+            model_bundle = joblib.load(BytesIO(model_bytes))
+            return model_bundle
         except Exception as e:
-            logging.warning(f"Failed loading model from S3 ({s3_key}): {e}")
+            logging.warning(f"Failed loading s3://{bucket}/{s3_key}: {e}")
             return None
 
     def load_all_models(self) -> None:
@@ -167,9 +167,9 @@ class GamePredictor:
         
         if self.data_obj.storage_mode == "s3":
             # Load models from S3
-            bucket_name = os.getenv("LEAGUE_PREDICTIONS_BUCKET_NAME")
+            bucket_name = os.getenv(self.predictions_bucket_name)
             if not bucket_name:
-                logging.error("LEAGUE_PREDICTIONS_BUCKET_NAME environment variable not set for S3 mode.")
+                logging.error(f"{self.predictions_bucket_name} environment variable not set for S3 mode.")
                 return
             
             s3_client = boto3.client('s3')
@@ -629,7 +629,7 @@ class GamePredictor:
         
         # Save to file if requested
         if save_to_file and not predictions_df.empty:
-            local_predictions_dir = './game_predictions/'
+            local_predictions_dir = os.path.join(self.root_dir, 'game_predictions')
             os.makedirs(local_predictions_dir, exist_ok=True)
             
             week, year = (predictions_df['week'].iloc[0], predictions_df['year'].iloc[0])
@@ -891,18 +891,26 @@ class GamePredictor:
 
 if __name__ == "__main__":
     # Initialize data object
+    # data_obj = DataObject(
+    #     league='nfl',
+    #     storage_mode='local',
+    #     local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
+    # )
+
     data_obj = DataObject(
-        league='nfl',
-        storage_mode='local',
-        local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
+        storage_mode='s3',
+        s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
     )
     
     # Create predictor and load all models
-    predictor = GamePredictor(data_obj=data_obj, models={})
-    predictor.load_all_models()
+    predictor = GamePredictor(
+        data_obj=data_obj,
+        root_dir='./',
+        predictions_bucket_name='LEAGUE_PREDICTIONS_BUCKET_NAME'
+    )
     
     # Example: Predict all next games and save to file
-    # predictions_df = predictor.predict_all_next_games(save_to_file=True, upload_to_s3=False)
+    predictions_df = predictor.predict_all_next_games(save_to_file=True, upload_to_s3=True)
     
     # # # Example: Predict a single game
     # single_game_predictions = predictor.predict_single_game('GNB')
@@ -913,4 +921,4 @@ if __name__ == "__main__":
     # predictor.create_all_past_predictions_from_merged(save_to_file=True, upload_to_s3=True)
 
     # Example: Update all past predictions
-    predictor.update_all_past_predictions(save_to_file=True, upload_to_s3=True)
+    # predictor.update_all_past_predictions(save_to_file=True, upload_to_s3=True)

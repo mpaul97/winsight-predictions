@@ -650,7 +650,7 @@ class PlayerPredictor:
 
     def _save_predictions(self, df: pd.DataFrame):
         """Save prediction results to CSV files, grouped by position."""
-        local_predictions_dir = './player_predictions/'
+        local_predictions_dir = os.path.join(self.root_dir, 'player_predictions')
         os.makedirs(local_predictions_dir, exist_ok=True)
         
         # Ensure required columns are first

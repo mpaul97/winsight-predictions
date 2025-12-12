@@ -14,7 +14,12 @@ if __name__ == "__main__":
         s3_bucket=os.getenv("SPORTS_DATA_BUCKET_NAME")
     )
     
-    predictor = PlayerPredictor(data_obj=data_obj)
+    run_dir = "./test_run"
+    predictor = PlayerPredictor(
+        data_obj=data_obj,
+        root_dir=run_dir,
+        predictions_bucket_name="LEAGUE_PREDICTIONS_BUCKET_NAME"
+    )
     
     # Example 1: Predict for a single player (all targets)
     # predictor.predict_single_player(pid='LoveJo03', position='QB', show=True)

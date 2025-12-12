@@ -44,6 +44,7 @@ htmlcov/
 **/features/
 **/predicted_features/
 **/train/
+**/test_run/
 
 # data files
 *.csv
