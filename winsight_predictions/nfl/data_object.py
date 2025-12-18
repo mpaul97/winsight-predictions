@@ -1,6 +1,7 @@
 import os
 import logging
 import sys
+import traceback
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -19,6 +20,12 @@ except ImportError:
     from const import TEAM_TO_PLAYER_ABBR_MAPPINGS, CONFERENCE_MAPPINGS, DIVISION_MAPPINGS
 
 from mp_sportsipy.nfl.constants import SIMPLE_POSITION_MAPPINGS
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
 
 class DataObject:
     """
@@ -86,27 +93,54 @@ class DataObject:
             self.s3_bucket = s3_bucket or os.getenv("SPORTS_DATA_BUCKET_NAME", "")
             if not self.s3_bucket:
                 logging.warning("S3 bucket name not provided or env SPORTS_DATA_BUCKET_NAME missing.")
-        self._s3 = s3_client or boto3.client("s3")
+            self._s3 = s3_client or boto3.client("s3")
 
         # --- Unified helpers ---
-        
-        # Data containers (lazy loaded)
-        self._schedules: pd.DataFrame | None = None
-        self._standings: pd.DataFrame | None = None
-        self._previews: pd.DataFrame | None = None
-        self._starters: pd.DataFrame | None = None
-        self._starters_new: pd.DataFrame | None = None
-        self._boxscores: pd.DataFrame | None = None
-        self._player_data: pd.DataFrame | None = None
-        self._player_snaps: pd.DataFrame | None = None
-        self._advanced_stats: Dict[str, pd.DataFrame] = {}
-        self._pbp_features: Dict[str, pd.DataFrame] = {}
-        self._team_ranks: Dict[str, pd.DataFrame] = {}
-        self._player_group_ranks: Dict[str, pd.DataFrame] = {}
-        self._game_predictions: pd.DataFrame | None = None
-        self._next_game_predictions: pd.DataFrame | None = None
-        self._cache: Dict[str, pd.DataFrame] = {}  # General cache for utility methods
+        def _read_csv(path: str, **kwargs) -> pd.DataFrame:
+            if self.storage_mode == "local":
+                return pd.read_csv(path, **kwargs)
+            # S3 path treated as key
+            try:
+                resp = self._s3.get_object(Bucket=self.s3_bucket, Key=path)
+                content = resp["Body"].read().decode("utf-8")
+                return pd.read_csv(StringIO(content), **kwargs)
+            except Exception as e:
+                logging.error(f"Error reading S3 CSV {path}: {e}")
+                return pd.DataFrame()
 
+        def _listdir(prefix_or_path: str) -> List[str]:
+            if self.storage_mode == "local":
+                if not os.path.exists(prefix_or_path):
+                    return []
+                return sorted(os.listdir(prefix_or_path))
+            # S3 listing
+            keys: List[str] = []
+            continuation: Optional[str] = None
+            while True:
+                params = {"Bucket": self.s3_bucket, "Prefix": prefix_or_path}
+                if continuation:
+                    params["ContinuationToken"] = continuation
+                try:
+                    resp = self._s3.list_objects_v2(**params)
+                except Exception as e:
+                    logging.error(f"Error listing S3 prefix {prefix_or_path}: {e}")
+                    break
+                for obj in resp.get("Contents", []):
+                    key = obj["Key"]
+                    if key.endswith("/"):  # skip 'directories'
+                        continue
+                    # Extract filename portion relative to prefix
+                    filename = key[len(prefix_or_path):] if key.startswith(prefix_or_path) else key
+                    if filename:
+                        keys.append(filename)
+                continuation = resp.get("NextContinuationToken")
+                if not continuation:
+                    break
+            return sorted(keys)
+
+        self._read_csv = _read_csv
+        self._listdir = _listdir
+        
         # Rank configurations
         self.team_rank_configs = [
             {'mode': 'season', 'split': None},
@@ -164,63 +198,6 @@ class DataObject:
         self.CONFERENCE_MAPPINGS = CONFERENCE_MAPPINGS
 
         logging.info(f"Initialized DataObject for {league.upper()}")
-
-        return
-
-    def _read_csv(self, path: str, **kwargs) -> pd.DataFrame:
-        if self.storage_mode == "local":
-            return pd.read_csv(path, **kwargs)
-        # S3 path treated as key
-        try:
-            path = str(path).replace("//", "/").replace("\\", "/")
-            resp = self._s3.get_object(Bucket=self.s3_bucket, Key=path)
-            content = resp["Body"].read().decode("utf-8")
-            return pd.read_csv(StringIO(content), **kwargs)
-        except Exception as e:
-            logging.error(f"Error reading S3 CSV {path}: {e}")
-            return pd.DataFrame()
-
-    def _listdir(self, prefix_or_path: str) -> List[str]:
-        if self.storage_mode == "local":
-            if not os.path.exists(prefix_or_path):
-                return []
-            return sorted(os.listdir(prefix_or_path))
-        # S3 listing
-        keys: List[str] = []
-        continuation: Optional[str] = None
-        while True:
-            params = {"Bucket": self.s3_bucket, "Prefix": prefix_or_path}
-            if continuation:
-                params["ContinuationToken"] = continuation
-            try:
-                resp = self._s3.list_objects_v2(**params)
-            except Exception as e:
-                logging.error(f"Error listing S3 prefix {prefix_or_path}: {e}")
-                break
-            for obj in resp.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith("/"):  # skip 'directories'
-                    continue
-                # Extract filename portion relative to prefix
-                filename = key[len(prefix_or_path):] if key.startswith(prefix_or_path) else key
-                if filename:
-                    keys.append(filename)
-            continuation = resp.get("NextContinuationToken")
-            if not continuation:
-                break
-        return sorted(keys)
-        
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        # Don't pickle the S3 client, it will be recreated
-        if '_s3' in state and state['_s3'] is not None:
-            state['_s3'] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        if self.storage_mode == 's3' and self._s3 is None:
-            self._s3 = boto3.client('s3')
     
     # ====================================================================
     # SCHEDULES
@@ -238,7 +215,7 @@ class DataObject:
         logging.info("Loading schedules...")
         df = pd.DataFrame()
         
-        if not os.path.exists(self.local_schedules_dir) and self.storage_mode == "local":
+        if not os.path.exists(self.local_schedules_dir):
             logging.warning(f"Schedules directory not found: {self.local_schedules_dir}")
             return df
         
@@ -301,7 +278,7 @@ class DataObject:
         """Load most recent preview file."""
         logging.info("Loading previews...")
         
-        if not os.path.exists(self.previews_dir) and self.storage_mode == "local":
+        if not os.path.exists(self.previews_dir):
             logging.warning(f"Previews directory not found: {self.previews_dir}")
             return pd.DataFrame()
         
@@ -383,7 +360,7 @@ class DataObject:
         """Load most recent starters file."""
         logging.info("Loading new starters...")
         
-        if not os.path.exists(self.starters_dir) and self.storage_mode == "local":
+        if not os.path.exists(self.starters_dir):
             logging.warning(f"Starters directory not found: {self.starters_dir}")
             return pd.DataFrame()
         
@@ -726,7 +703,7 @@ class DataObject:
         logging.info("Loading PBP features...")
         pbp_dict = {}
         
-        if not os.path.exists(self.local_pbp_features_dir) and self.storage_mode == "local":
+        if not os.path.exists(self.local_pbp_features_dir):
             logging.warning(f"PBP features directory not found: {self.local_pbp_features_dir}")
             return pbp_dict
         
@@ -821,7 +798,7 @@ class DataObject:
         
         df = pd.DataFrame()
         
-        if not os.path.exists(local_dir) and self.storage_mode == "local":
+        if not os.path.exists(local_dir):
             logging.warning(f"Team ranks directory not found: {local_dir}")
             return df
         
@@ -879,7 +856,7 @@ class DataObject:
         
         df = pd.DataFrame()
         
-        if not os.path.exists(local_dir) and self.storage_mode == "local":
+        if not os.path.exists(local_dir):
             logging.warning(f"Player group ranks directory not found: {local_dir}")
             return df
         
@@ -1689,6 +1666,11 @@ class DataObject:
                             np.nan,  # Placeholder for mov_of_favorite
                             home_abbr if home_is_favorite else away_abbr
                         ])
+                elif row.get('vegas_line', '') == 'Pick':
+                    return pd.Series([0.0, True, np.nan, np.nan, np.nan])
+                else:
+                    logging.error(f"Could not determine spread or favorite for {row['away_abbr']} vs {row['home_abbr']}, vegas_line='{row.get('vegas_line', '')}'")
+                    return pd.Series([np.nan, np.nan, np.nan, np.nan, np.nan])
             except Exception as e:
                 if row.get('vegas_line', '') == 'Pick':
                     return pd.Series([0.0, True, np.nan, np.nan, np.nan])
@@ -2077,17 +2059,16 @@ class DataObject:
         return self._listdir(directory_or_prefix)
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
-    load_dotenv()
     # Example usage
-    # data_obj = DataObject(
-    #     storage_mode='s3',
-    #     s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
-    # )
     data_obj = DataObject(
         league='nfl',
         storage_mode='local',
-        local_root=os.path.join(sys.path[0], "..", "..", "..", "sports-data-storage-copy/")
+        local_root=os.path.join(sys.path[0], "..", "..", "..", 'sports-data-storage-copy')
     )
-    df = data_obj.player_data
-    print(df[['week']])
+    df = data_obj.previews
+    print(df)
+    # position, target = 'QB', 'passing_yards'
+    # pos_df = df[df['pos'] == position]
+    # total_players = len(pos_df['pid'].unique())
+    
+    # logging.info(f"Training {position}_{target} with {total_players} players")

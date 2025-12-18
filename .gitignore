@@ -53,6 +53,7 @@ htmlcov/
 *.ipynb
 **/game_predictions/
 **/player_predictions/
+**/outcome_predictions/
 
 # environment files
 .env
