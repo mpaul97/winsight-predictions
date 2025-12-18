@@ -129,7 +129,6 @@ class FeatureEngine:
 			last_group_df = last_group_df.loc[last_group_df['diff'].idxmin()] \
 				.to_frame().transpose().reset_index(drop=True) \
 				.drop(drop_cols, axis=1, errors='ignore')
-			last_group_df = last_group_df.fillna(0.0)
 			result = last_group_df.add_prefix("last_game_sim_").to_dict(orient='records')[0]
 		except Exception:
 			result = {}
@@ -230,13 +229,6 @@ class FeatureEngine:
 		opp_abbr = row['away_abbr'] if is_home == 1 else row.get('home_abbr', row.get('opp_abbr'))
 		out: Dict[str, Any] = {}
 		
-		# Simple encodings for non-numeric columns
-		conference_encoding = {'AFC': 0, 'NFC': 1}
-		division_encoding = {
-			'AFC East': 0, 'AFC North': 1, 'AFC South': 2, 'AFC West': 3,
-			'NFC East': 4, 'NFC North': 5, 'NFC South': 6, 'NFC West': 7
-		}
-		
 		for tag, prefix in [(abbr, 'team_standing_'), (opp_abbr, 'opp_standing_')]:
 			current_week = row.get('week')
 			current_year = row.get('year')
@@ -259,28 +251,8 @@ class FeatureEngine:
 			else:
 				vals = self.standings_cache[cache_key]
 			
-			# Batch dictionary update with encodings
-			for k, v in vals.items():
-				feature_key = f'{prefix}{k}'
-				
-				# Apply encodings for non-numeric columns
-				if k == 'conference':
-					out[feature_key] = conference_encoding.get(v, -1) if isinstance(v, str) else v
-				elif k == 'division':
-					out[feature_key] = division_encoding.get(v, -1) if isinstance(v, str) else v
-				elif k in ['is_division_winner', 'is_wild_card']:
-					# Convert boolean strings to integers
-					if isinstance(v, str):
-						out[feature_key] = 1 if v.lower() == 'true' else 0
-					elif isinstance(v, bool):
-						out[feature_key] = int(v)
-					else:
-						out[feature_key] = v
-				elif k in ['name', 'abbr']:
-					# Skip name and abbr columns as they are identifiers, not features
-					continue
-				else:
-					out[feature_key] = v
+			# Batch dictionary update
+			out.update({f'{prefix}{k}': v for k, v in vals.items()})
 		
 		return out
 
@@ -292,7 +264,6 @@ class FeatureEngine:
 		is_home = self.row['is_home']
 		opp_abbr = self.row['away_abbr'] if is_home == 1 else self.row.get('home_abbr', self.row.get('opp_abbr'))
 		pos = self.position
-		logging.debug(f"[Opp Big Plays Feature]: {date}, {is_home}, {opp_abbr}, {pos}")
 		cache_key = f"{opp_abbr}_{date.isoformat()}_{pos}"
 		
 		if cache_key not in self.opp_big_plays_cache:
@@ -310,7 +281,7 @@ class FeatureEngine:
 		if df is not None and not df.empty and self.big_play_stat_columns:
 			n_rows = len(df)
 			# Vectorized: get all stats at once using numpy array operations
-			stats_array = df[self.big_play_stat_columns].fillna(0.0).values
+			stats_array = df[self.big_play_stat_columns].values
 			
 			# Single aggregation operations
 			last_game_vals = stats_array[-1] if n_rows > 0 else np.zeros(len(self.big_play_stat_columns))
@@ -341,34 +312,28 @@ class FeatureEngine:
 	def _load_game_targets_features(self) -> Dict[str, Any]:
 		row = self.row
 		is_home = row['is_home']
-		src_df = self.game_predictions.copy().rename(columns={ 'game_id':'key' })
+		src_df = self.game_predictions.copy().rename(columns={'game_id':'key'})
 		features: Dict[str, Any] = {}
 		game_targets_regression = ['points', 'total_yards', 'pass_yards', 'rush_yards', 'pass_attempts', 'rush_attempts']
 		game_targets_classification = ['win']
-		try:
-			if src_df is not None and not src_df.empty:
-				preds_row = src_df[src_df['key'] == row['key']].iloc[0].to_dict()
-				if is_home == 1:
-					for t in game_targets_regression:
-						features[f'team_game_{t}'] = preds_row.get(f'predicted_home_{t}', preds_row.get(f'home_{t}', np.nan))
-						features[f'opp_game_{t}'] = preds_row.get(f'predicted_away_{t}', preds_row.get(f'away_{t}', np.nan))
-					features['team_game_win'] = preds_row.get('predicted_home_win', preds_row.get(f'home_win', np.nan))
-					features['opp_game_win'] = preds_row.get('predicted_away_win', 1 - preds_row.get(f'home_win', np.nan))
-				else:
-					for t in game_targets_regression:
-						features[f'team_game_{t}'] = preds_row.get(f'predicted_away_{t}', preds_row.get(f'away_{t}', np.nan))
-						features[f'opp_game_{t}'] = preds_row.get(f'predicted_home_{t}', preds_row.get(f'home_{t}', np.nan))
-					features['team_game_win'] = preds_row.get('predicted_away_win', 1 - preds_row.get(f'home_win', np.nan))
-					features['opp_game_win'] = preds_row.get('predicted_home_win', preds_row.get(f'home_win', np.nan))
+		if src_df is not None and not src_df.empty:
+			preds_row = src_df[src_df['key'] == row['key']].iloc[0].to_dict()
+			if is_home == 1:
+				for t in game_targets_regression:
+					features[f'team_game_{t}'] = preds_row.get(f'predicted_home_{t}', preds_row.get(f'home_{t}', np.nan))
+					features[f'opp_game_{t}'] = preds_row.get(f'predicted_away_{t}', preds_row.get(f'away_{t}', np.nan))
+				features['team_game_win'] = preds_row.get('predicted_home_win', preds_row.get(f'home_win', np.nan))
+				features['opp_game_win'] = preds_row.get('predicted_away_win', preds_row.get(f'away_win', np.nan))
 			else:
-				for t in game_targets_regression + game_targets_classification:
-					features[f'team_game_{t}'] = row.get(f'team_game_{t}', np.nan)
-					features[f'opp_game_{t}'] = row.get(f'opp_game_{t}', np.nan)
-		except Exception as e:
-			logging.warning(f"Error loading game target features for row {row.get('key', 'unknown')}: {e}")
+				for t in game_targets_regression:
+					features[f'team_game_{t}'] = preds_row.get(f'predicted_away_{t}', preds_row.get(f'away_{t}', np.nan))
+					features[f'opp_game_{t}'] = preds_row.get(f'predicted_home_{t}', preds_row.get(f'home_{t}', np.nan))
+				features['team_game_win'] = preds_row.get('predicted_away_win', preds_row.get(f'away_win', np.nan))
+				features['opp_game_win'] = preds_row.get('predicted_home_win', preds_row.get(f'home_win', np.nan))
+		else:
 			for t in game_targets_regression + game_targets_classification:
-				features[f'team_game_{t}'] = np.nan
-				features[f'opp_game_{t}'] = np.nan
+				features[f'team_game_{t}'] = row.get(f'team_game_{t}', np.nan)
+				features[f'opp_game_{t}'] = row.get(f'opp_game_{t}', np.nan)
 		return features
 
 	# ========== Property wrappers ==========
@@ -379,7 +344,7 @@ class FeatureEngine:
 		# AFTER: O(n) - single pass with vectorized pandas operations
 		if self._rolling_target_stats is None:
 			pg = self.prior_games; tn = self.target_name
-			target_values = pg[tn].fillna(0.0).values  # Single array access
+			target_values = pg[tn].values  # Single array access
 			n_games = len(target_values)
 			
 			# Pre-compute all aggregates in one pass
@@ -391,7 +356,7 @@ class FeatureEngine:
 			}
 			
 			# Vectorized rolling computation - single operation
-			rolling_means = pg[tn].fillna(0.0).rolling(window=10, min_periods=1).mean().values
+			rolling_means = pg[tn].rolling(window=10, min_periods=1).mean().values
 			for i in range(2, 7):
 				d[f'last{i}_rolling_{tn}'] = rolling_means[-i] if len(rolling_means) >= i else np.nan
 			
@@ -450,7 +415,7 @@ class FeatureEngine:
 				return self._last_game_numeric_stats
 			
 			# Vectorized: select numeric columns and exclude target in one operation
-			numeric_cols = [col for col in pg.select_dtypes(exclude=[object]).columns if 'game_date' not in col]
+			numeric_cols = [col for col in pg.select_dtypes(exclude=[object]).columns]
 			
 			if numeric_cols:
 				# Single iloc operation to get last row
@@ -555,7 +520,7 @@ class FeatureEngine:
 			
 			for c in ['epa', 'epa_added']:
 				if c in pg.columns:
-					values = pg[c].fillna(0.0).values
+					values = pg[c].values
 					d[f'overall_avg_{c}'] = values.mean()
 					d[f'last5_avg_{c}'] = values[-5:].mean() if n_games >= 5 else values.mean()
 					d[f'last10_avg_{c}'] = values[-10:].mean() if n_games >= 10 else values.mean()
@@ -735,6 +700,7 @@ class FeatureEngine:
 			
 			big_play_cols = ['big_play_count_10', 'big_play_count_20', 'big_play_count_30', 'big_play_count_40', 'big_play_count_50']
 			available_cols = [col for col in big_play_cols if col in pg.columns]
+			
 			if available_cols:
 				n_games = len(pg)
 				# Pre-filter for season if year column exists
@@ -742,13 +708,13 @@ class FeatureEngine:
 				
 				# Vectorized: process all columns at once
 				for col in available_cols:
-					col_values = pg[col].fillna(0.0).values
+					col_values = pg[col].values
 					d[f'overall_total_{col}'] = col_values.sum()
 					d[f'last5_total_{col}'] = col_values[-5:].sum() if n_games >= 5 else col_values.sum()
 					d[f'last10_total_{col}'] = col_values[-10:].sum() if n_games >= 10 else col_values.sum()
 					if season_mask is not None:
 						d[f'season_total_{col}'] = pg.loc[season_mask, col].sum()
-						
+			
 			self._big_plays_player_features = d
 		return self._big_plays_player_features
 

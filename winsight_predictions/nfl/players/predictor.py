@@ -1,39 +1,3 @@
-"""Lean player prediction and training interfaces.
-
-This module intentionally removes the legacy monolithic `Predictor` class
-and all duplicated feature engineering logic. Feature construction is now
-exclusively delegated to `FeatureEngine` (see `features.py`). Data loading,
-storage mode abstraction (local vs S3), and ancillary metadata are handled
-by `DataObject` (see `data_object.py`).
-
-Provided classes:
------------------
-1. PlayerPredictor (inference only)
-   - Consumes pre-trained per-target models you supply.
-   - Iteratively predicts targets in dependency order so later targets can
-     incorporate earlier predictions (e.g. yards depend on attempts &
-     completions; fantasy points depend on all positional stat outputs).
-   - Uses a private helper to instantiate FeatureEngine consistently.
-
-2. PlayerModelTrainer (simple training helper)
-   - Builds per-target training rows from historical player games.
-   - Trains a baseline model (RandomForestRegressor if available; else a
-     tiny MeanRegressor). Persisted with joblib under `model_dir`.
-   - Returns the fitted model object for integration into inference.
-
-Targets & Ordering:
--------------------
-Targets are predicted in grouped passes to respect dependencies. Only the
-over/under targets present in FeatureEngine's `feature_dependencies` are
-kept here (legacy attempted/rush_attempts over/under thresholds removed).
-
-Extending:
-----------
-Add new target names to the appropriate group lists (or create a new group
-if dependency layering changes) and ensure your models dict contains the
-`POSITION_target` key with a `.predict(2D_array)` interface.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -459,7 +423,8 @@ class PlayerPredictor:
         position: str, 
         target_subset: Optional[List[str]] = None,
         show: Optional[bool] = False,
-        accumulate_features: bool = False
+        accumulate_features: bool = False,
+        predict_past_days: Optional[int] = None
     ) -> Optional[Dict[str, float]]:
         """Predict targets for a single player.
         
@@ -506,9 +471,14 @@ class PlayerPredictor:
         upcoming_row['starter'] = int(pid in self.data_obj.starters_new['player_id'].values)
         
         # Check game is in future (with 1 day buffer)
-        if upcoming_row['game_date'] <= pd.Timestamp(datetime.now().date() - timedelta(days=1)):
-            logging.warning(f"Game date {upcoming_row['game_date']} is not in the future")
-            return None
+        if not predict_past_days:
+            if upcoming_row['game_date'] <= pd.Timestamp(datetime.now().date() - timedelta(days=1)):
+                logging.warning(f"Game date {upcoming_row['game_date']} is not in the future")
+                return None
+        else:
+            if upcoming_row['game_date'] <= pd.Timestamp(datetime.now().date() - timedelta(days=predict_past_days)):
+                logging.warning(f"Game date {upcoming_row['game_date']} is older than {predict_past_days} days")
+                return None
         
         # Determine targets to predict
         if target_subset:
@@ -557,11 +527,52 @@ class PlayerPredictor:
         
         return predictions if predictions else None
     
+    async def predict_single_player_async(
+        self,
+        pid: str,
+        position: str,
+        target_subset: Optional[List[str]] = None,
+        accumulate_features: bool = False,
+        semaphore: Optional[Semaphore] = None,
+        predict_past_days: Optional[int] = None
+    ) -> Optional[Dict[str, float]]:
+        """Asynchronous version of predict_single_player."""
+        async with semaphore:
+            return await asyncio.to_thread(
+                self.predict_single_player,
+                pid=pid,
+                position=position,
+                target_subset=target_subset,
+                accumulate_features=accumulate_features,
+                predict_past_days=predict_past_days
+            )
+
+    async def _run_predictions_async(self, starters: pd.DataFrame, save_features: bool, predict_past_days: Optional[int]) -> List[Dict]:
+        """Helper to run player predictions asynchronously."""
+        tasks = []
+        sem = asyncio.Semaphore(10)  # Limit concurrency
+
+        for _, row in starters.iterrows():
+            task = asyncio.create_task(
+                self.predict_single_player_async(
+                    pid=row['player_id'],
+                    position=row['position'],
+                    accumulate_features=save_features,
+                    semaphore=sem,
+                    predict_past_days=predict_past_days
+                )
+            )
+            tasks.append(task)
+
+        results = await asyncio.gather(*tasks)
+        return [res for res in results if res is not None]
+
     def predict_next_players(
         self,
         positions: Optional[List[str]] = None,
         save_results: bool = True,
-        save_features: bool = True
+        save_features: bool = True,
+        predict_past_days: Optional[int] = None
     ) -> Optional[pd.DataFrame]:
         """Predict for all starters in upcoming games using optimized batching and asyncio.
         
@@ -587,7 +598,7 @@ class PlayerPredictor:
         df = df[(df['year'] == season) & (df['pos'].isin(['RB', 'WR', 'TE']))]
         df = df.groupby(['abbr', 'year', 'player_name', 'pos', 'pid']).filter(lambda x: x['off_pct'].mean() > 0.4)
         df = df[['abbr', 'player_name', 'pos', 'pid']].reset_index(drop=True).drop_duplicates(subset=['pid'])
-        df = df.rename(columns={'abbr': 'team_abbr', 'pid': 'player_id', 'pos': 'position'})
+        df = df.rename(columns={'abbr': 'team', 'pid': 'player_id', 'pos': 'position'})
         starters = pd.concat([starters, df], ignore_index=True).drop_duplicates(subset=['player_id'])
 
         if positions:
@@ -595,7 +606,7 @@ class PlayerPredictor:
 
         # Run predictions asynchronously
         all_predictions = asyncio.run(
-            self._run_predictions_async(starters, save_features)
+            self._run_predictions_async(starters, save_features, predict_past_days)
         )
 
         if not all_predictions:
@@ -612,43 +623,6 @@ class PlayerPredictor:
             self._save_feature_groupings()
 
         return df
-
-    async def _run_predictions_async(self, starters: pd.DataFrame, save_features: bool) -> List[Dict]:
-        """Helper to run player predictions asynchronously."""
-        tasks = []
-        sem = asyncio.Semaphore(10)  # Limit concurrency
-
-        for _, row in starters.iterrows():
-            task = asyncio.create_task(
-                self.predict_single_player_async(
-                    pid=row['player_id'],
-                    position=row['position'],
-                    accumulate_features=save_features,
-                    semaphore=sem
-                )
-            )
-            tasks.append(task)
-
-        results = await asyncio.gather(*tasks)
-        return [res for res in results if res is not None]
-
-    async def predict_single_player_async(
-        self,
-        pid: str,
-        position: str,
-        target_subset: Optional[List[str]] = None,
-        accumulate_features: bool = False,
-        semaphore: Optional[Semaphore] = None
-    ) -> Optional[Dict[str, float]]:
-        """Asynchronous version of predict_single_player."""
-        async with semaphore:
-            return await asyncio.to_thread(
-                self.predict_single_player,
-                pid=pid,
-                position=position,
-                target_subset=target_subset,
-                accumulate_features=accumulate_features
-            )
 
     def _save_predictions(self, df: pd.DataFrame):
         """Save prediction results to CSV files, grouped by position."""
@@ -705,5 +679,5 @@ if __name__ == "__main__":
     # predictor.predict_single_player(pid='LoveJo03', position='QB', show=True)
     
     # Example 2: Predict for all starters
-    predictor.predict_next_players()
+    predictor.predict_next_players(predict_past_days=7)
 
