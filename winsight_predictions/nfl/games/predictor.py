@@ -247,20 +247,19 @@ class GamePredictor:
         
         logging.info(f"Loaded {count} model bundles from {self.data_obj.storage_mode} storage")
 
-    def prepare_upcoming_games(self) -> pd.DataFrame:
+    def prepare_upcoming_games(self, df: pd.DataFrame) -> pd.DataFrame:
         """Prepare upcoming games DataFrame from data_obj.previews."""
-        previews = self.data_obj.previews.copy()
-        if previews.empty:
-            logging.warning("No previews available in data_obj.previews")
-            return pd.DataFrame()
         
         # Filter to home team rows to avoid duplicates
-        upcoming_games = previews[previews['is_home'] == 1].copy()
-        upcoming_games = upcoming_games.rename(columns={'abbr': 'home_abbr', 'opp_abbr': 'away_abbr'})
+        if 'is_home' in df.columns:
+            upcoming_games = df[df['is_home'] == 1].copy()
+            upcoming_games = upcoming_games.rename(columns={'abbr': 'home_abbr', 'opp_abbr': 'away_abbr'})
+        else:
+            upcoming_games = df.copy()
         
         # Get current week/year info
-        current_week = previews['week'].mode()[0] if not previews['week'].empty else previews['week'].iloc[0]
-        current_year = previews['year'].mode()[0] if not previews['year'].empty else previews['year'].iloc[0]
+        current_week = df['week'].mode()[0] if not df['week'].empty else df['week'].iloc[0]
+        current_year = df['year'].mode()[0] if not df['year'].empty else df['year'].iloc[0]
         
         # Find last completed week
         last_week = self.data_obj.schedules[
@@ -591,7 +590,12 @@ class GamePredictor:
             logging.warning("No models loaded. Call load_all_models() or load_models_from_dir() first.")
             return pd.DataFrame()
         
-        upcoming_games = self.prepare_upcoming_games()
+        previews = self.data_obj.previews.copy()
+        if previews.empty:
+            logging.warning("No previews available in data_obj.previews")
+            return pd.DataFrame()
+
+        upcoming_games = self.prepare_upcoming_games(previews)
         if upcoming_games.empty:
             logging.warning("No upcoming games to predict")
             return pd.DataFrame()
@@ -755,7 +759,8 @@ class GamePredictor:
         """Update all past game predictions by adding missing game predictions.
         
         This method checks for games that exist in boxscores but are missing from the 
-        existing predictions file, and only creates predictions for those missing games.
+        existing predictions file, generates predictions for those missing games using
+        the same process as predict_all_next_games(), and concatenates with existing predictions.
         
         Args:
             save_to_file: If True, save updated predictions to CSV file
@@ -769,16 +774,32 @@ class GamePredictor:
             logging.warning("No boxscore data available to update past predictions")
             return pd.DataFrame()
         
-        local_predictions_dir = './game_predictions/'
-        os.makedirs(local_predictions_dir, exist_ok=True)
-        existing_predictions_path = os.path.join(local_predictions_dir, 'all_past_game_predictions.csv')
-        
-        # Check for missing game_ids
-        if not os.path.exists(existing_predictions_path):
-            logging.info("No existing predictions file found. Creating all predictions from scratch.")
-            return self.create_all_past_predictions_from_merged(save_to_file=save_to_file, upload_to_s3=upload_to_s3)
-        
-        existing_df = pd.read_csv(existing_predictions_path)
+        # Load existing predictions
+        if self.data_obj.storage_mode == 'local':
+            local_predictions_dir = './game_predictions/'
+            os.makedirs(local_predictions_dir, exist_ok=True)
+            existing_predictions_path = os.path.join(local_predictions_dir, 'all_past_game_predictions.csv')
+            
+            if not os.path.exists(existing_predictions_path):
+                logging.info("No existing predictions file found. Creating all predictions from scratch.")
+                return self.create_all_past_predictions_from_merged(save_to_file=save_to_file, upload_to_s3=upload_to_s3)
+            
+            existing_df = pd.read_csv(existing_predictions_path)
+
+        else: # load from S3
+            bucket_name = os.getenv("SPORTS_DATA_BUCKET_NAME", "")
+            s3_key = 'nfl/game_predictions/all_past_game_predictions.csv'
+            s3_client = boto3.client('s3')
+            
+            try:
+                response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+                existing_bytes = response['Body'].read()
+                existing_df = pd.read_csv(BytesIO(existing_bytes))
+            except Exception as e:
+                logging.info(f"No existing predictions file found in S3. Creating all predictions from scratch. Error: {e}")
+                return self.create_all_past_predictions_from_merged(save_to_file=save_to_file, upload_to_s3=upload_to_s3)
+
+        # Identify missing games
         existing_keys = set(existing_df['game_id'].unique())
         boxscore_keys = set(boxscores['key'].unique())
         missing_keys = boxscore_keys - existing_keys
@@ -787,122 +808,94 @@ class GamePredictor:
             logging.info("No missing game predictions found; all up to date")
             return existing_df
         
-        logging.info(f"Found {len(missing_keys)} missing game predictions to update \n {missing_keys}")
+        logging.info(f"Found {len(missing_keys)} missing game predictions to update")
+        logging.info(f"Missing game_ids: {sorted(missing_keys)[:10]}{'...' if len(missing_keys) > 10 else ''}")
         
-        # Create predictions for missing games only using merged features
-        trainer = GameModelTrainer(self.data_obj)
-        new_df = pd.DataFrame()
-        all_targets = trainer.targets['regression'] + trainer.targets['classification']
+        # Get missing games from boxscores
+        missing_games = boxscores[boxscores['key'].isin(missing_keys)].copy()
+        missing_games = missing_games.merge(self.data_obj.schedules[['game_id', 'week']], left_on='key', right_on='game_id', how='left')
+        missing_games = self.prepare_upcoming_games(missing_games)
         
-        for target in all_targets:
-            # Load merged features for this target
-            merged = trainer._load_and_merge_features(target)
-            if merged is None or merged.empty:
-                logging.warning(f"No merged features found for {target}")
-                continue
-            
-            # Filter to only missing game_ids
-            merged_missing = merged[merged['game_id'].isin(missing_keys)].copy()
-            if merged_missing.empty:
-                logging.warning(f"No features found for missing games for target {target}")
-                continue
-            
-            model = self.models.get(target)
-            scaler = self.scalers.get(target)
-            feature_names = self.model_feature_names.get(target)
-            
-            if not (model and scaler and feature_names):
-                logging.warning(f"Missing model/scaler/feature_names for target {target}, skipping")
-                continue
-            
-            # Prepare features
-            source = merged_missing[['game_id', 'game_date', 'home_abbr', 'away_abbr']].copy()
-            key_cols = ['game_id', 'game_date', 'home_abbr', 'away_abbr']
-            X = merged_missing.drop(columns=key_cols + ['target'], errors='ignore')
-            
-            # Align to model's feature names
-            missing_cols = [col for col in feature_names if col not in X.columns]
-            if missing_cols:
-                missing_df = pd.DataFrame(0.0, index=X.index, columns=missing_cols)
-                X = pd.concat([X, missing_df], axis=1)
-            X = X[feature_names].fillna(0.0)
-            
-            # Make predictions
-            X_scaled = scaler.transform(X)
-            
-            # Use predict_proba for classification models
-            if target in self.classification_targets:
-                preds = model.predict_proba(X_scaled)[:, 1]
-            else:
-                preds = model.predict(X_scaled)
-            
-            # If model uses residual training, add back the baseline (only for regression targets)
-            if self.use_residual_training.get(target, False) and target not in self.classification_targets:
-                baselines = self.team_baselines.get(target, {})
-                global_mean = self.global_means.get(target, 0.0)
-                
-                # Determine which team column to use based on target name
-                is_home_target = target.startswith('home_')
-                team_col = 'home_abbr' if is_home_target else 'away_abbr'
-                
-                if baselines:
-                    sample_key = next(iter(baselines.keys()))
-                    if isinstance(sample_key, tuple):
-                        # Time-varying baselines (team_abbr, game_date)
-                        baseline_values = source.apply(
-                            lambda row: baselines.get((row[team_col], row['game_date']), global_mean),
-                            axis=1
-                        ).values
-                    else:
-                        # Static baselines (team_abbr only)
-                        baseline_values = source[team_col].map(baselines).fillna(global_mean).values
-                    
-                    preds = preds + baseline_values
-                    logging.info(f"Added baselines to residual predictions for {target}")
-            
-            # Build result DataFrame
-            source[f'predicted_{target}'] = preds
-            
-            if new_df.empty:
-                new_df = source
-            else:
-                new_df = new_df.merge(source, on=['game_id', 'game_date', 'home_abbr', 'away_abbr'], how='outer')
-            
-            logging.info(f"Updated predictions for target {target}")
+        # Get historical game data for feature generation
+        game_data = self.data_obj.get_game_data_with_features()
         
-        # Combine with existing predictions
-        if not new_df.empty:
-            # Combine with existing predictions
-            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        # Predict for each missing game (same as predict_all_next_games)
+        all_predictions = []
+        for idx, row in tqdm(missing_games.iterrows(), total=len(missing_games), desc="Generating predictions"):
+            logging.info(f"Predicting game: {row.get('home_abbr')} vs {row.get('away_abbr')} on {row.get('game_date')}")
             
-            if save_to_file:
-                combined_df.round(2).to_csv(existing_predictions_path, index=False)
-                logging.info(f"Updated all past game predictions to {existing_predictions_path}")
+            try:
+                predictions = self.predict_game(game_data, row)
                 
-                if upload_to_s3:
-                    upload_file_to_s3(
-                        file_path=existing_predictions_path,
-                        bucket_name=os.getenv("SPORTS_DATA_BUCKET_NAME", ""),
-                        s3_key='nfl/game_predictions/all_past_game_predictions.csv'
-                    )
-            
-            return combined_df
-        else:
+                # Combine game info with predictions
+                result = {
+                    'game_id': row.get('key', row.get('game_id', '')),
+                    'game_date': row.get('game_date'),
+                    'home_abbr': row.get('home_abbr'),
+                    'away_abbr': row.get('away_abbr'),
+                }
+                result.update(predictions)
+                all_predictions.append(result)
+            except Exception as e:
+                logging.warning(f"Failed to predict game {row.get('key', '')}: {e}")
+                traceback.print_exc()
+                continue
+        
+        if not all_predictions:
             logging.warning("No new predictions were generated")
             return existing_df
+        
+        # Convert to DataFrame
+        new_predictions_df = pd.DataFrame(all_predictions)
+        # Align columns with existing predictions
+        new_predictions_df = new_predictions_df.drop(columns=['week', 'year'], errors='ignore')
+        new_predictions_df = new_predictions_df.rename(columns={col: f"predicted_{col}" for col in new_predictions_df.columns if col not in ['game_id', 'game_date', 'home_abbr', 'away_abbr']})
+        logging.info(f"Generated predictions for {len(new_predictions_df)} missing games")
+        
+        # Combine with existing predictions
+        existing_df['game_date'] = pd.to_datetime(existing_df['game_date'], format='mixed')
+        combined_df = pd.concat([existing_df, new_predictions_df])
+        combined_df = combined_df.drop_duplicates(subset=['game_id']).sort_values('game_date')
+        
+        # Save to file if requested
+        if save_to_file:
+            if self.data_obj.storage_mode == 'local':
+                combined_df.round(2).to_csv(existing_predictions_path, index=False)
+                logging.info(f"Updated all past game predictions to {existing_predictions_path}")
+            else:
+                combined_df.round(2).to_csv(f"{self.root_dir}/all_past_game_predictions.csv", index=False)
+                logging.info(f"Updated all past game predictions to {self.root_dir}/all_past_game_predictions.csv")
+        
+        # Upload to S3 if requested
+        if upload_to_s3:
+            csv_buffer = BytesIO()
+            combined_df.round(2).to_csv(csv_buffer, index=False)
+            csv_buffer.seek(0)
+            
+            bucket_name = os.getenv("SPORTS_DATA_BUCKET_NAME", "")
+            s3_key = 'nfl/game_predictions/all_past_game_predictions.csv'
+            s3_client = boto3.client('s3')
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=csv_buffer.getvalue()
+            )
+            logging.info(f"Uploaded updated predictions to s3://{bucket_name}/{s3_key}")
+        
+        return combined_df
 
 if __name__ == "__main__":
     # Initialize data object
-    # data_obj = DataObject(
-    #     league='nfl',
-    #     storage_mode='local',
-    #     local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
-    # )
-
     data_obj = DataObject(
-        storage_mode='s3',
-        s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
+        league='nfl',
+        storage_mode='local',
+        local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
     )
+
+    # data_obj = DataObject(
+    #     storage_mode='s3',
+    #     s3_bucket=os.getenv('SPORTS_DATA_BUCKET_NAME')
+    # )
     
     # Create predictor and load all models
     predictor = GamePredictor(

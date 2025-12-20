@@ -303,7 +303,9 @@ class PlayerPredictor:
             player_group_ranks=self.data_obj.player_group_ranks,
             advanced_stat_cols=self.data_obj.advanced_stat_cols,
             big_play_stat_columns=self.data_obj.big_play_stat_columns,
-            game_predictions=self.data_obj.next_game_predictions
+            game_predictions=self.data_obj.next_game_predictions,
+            injury_reports=self.data_obj.injury_reports,
+            schedules=self.data_obj.schedules
         )
         
         # Build feature matrix directly without CSV I/O
@@ -350,6 +352,11 @@ class PlayerPredictor:
             merged_df = merged_df.merge(df, on=key_cols, how='outer', suffixes=('', '_dup'))
             # Drop duplicate columns
             merged_df = merged_df[[c for c in merged_df.columns if not c.endswith('_dup')]]
+
+        # Save snap prediction column if exists
+        snap_prediction = None
+        if 'snap_current_game_snap_counts' in merged_df.columns:
+            snap_prediction = merged_df['snap_current_game_snap_counts'].iloc[0]
         
         # Prepare feature matrix
         X_pred = merged_df.drop(columns=key_cols, errors='ignore')
@@ -366,7 +373,8 @@ class PlayerPredictor:
             X_pred = X_pred[feature_names]
         
         X_pred = X_pred.fillna(0.0)
-        
+        if target == 'fantasy_points':
+            X_pred[[col for col in X_pred.columns if 'snap' in col]].to_csv('debug_player_pred_features.csv', index=False)  # Debugging line
         # Scale and predict
         scaler = self.scalers.get(model_key)
         if scaler is not None:
@@ -415,7 +423,7 @@ class PlayerPredictor:
                          f"residual={prediction - player_baseline:.2f}, baseline={player_baseline:.2f}, "
                          f"final={prediction:.2f}")
         
-        return prediction
+        return prediction, snap_prediction
     
     def predict_single_player(
         self, 
@@ -502,13 +510,18 @@ class PlayerPredictor:
         
         # Generate predictions
         predictions = {}
+        snap_prediction = None
         for target in ordered_targets:
             try:
-                pred = self._predict_single_target(
+                pred, snap_pred = self._predict_single_target(
                     position, target, player_games, upcoming_row, predictions, accumulate_features
                 )
                 if pred is not None:
                     predictions[target] = pred
+
+                if snap_prediction is None:
+                    snap_prediction = snap_pred
+
             except Exception as e:
                 logging.warning(f"Failed to predict {target} for {pid}: {e}")
         
@@ -517,7 +530,8 @@ class PlayerPredictor:
                 'pid': pid,
                 'position': position,
                 'team_abbr': team_abbr,
-                'player_name': player_games['player_name'].iloc[-1] if 'player_name' in player_games.columns else ''
+                'player_name': player_games['player_name'].iloc[-1] if 'player_name' in player_games.columns else '',
+                'snap_prediction': snap_prediction
             })
             if show:
                 logging.info(f"Generated {len(predictions)-3} predictions for {pid}")
@@ -538,6 +552,7 @@ class PlayerPredictor:
     ) -> Optional[Dict[str, float]]:
         """Asynchronous version of predict_single_player."""
         async with semaphore:
+            logging.info(f"Starting async prediction for {pid} ({position})")
             return await asyncio.to_thread(
                 self.predict_single_player,
                 pid=pid,
@@ -569,7 +584,7 @@ class PlayerPredictor:
 
     def predict_next_players(
         self,
-        positions: Optional[List[str]] = None,
+        positions: List[str] = ['QB', 'RB', 'WR', 'TE'],
         save_results: bool = True,
         save_features: bool = True,
         predict_past_days: Optional[int] = None
@@ -593,13 +608,19 @@ class PlayerPredictor:
             return None
 
         # Add FLEX players
-        df = self.data_obj.player_data[['abbr', 'year', 'player_name', 'pos', 'pid', 'off_pct']]
+        df = self.data_obj.player_data[['abbr', 'year', 'player_name', 'pos', 'pid', 'off_pct', 'game_date']]
         season = df['year'].max()
-        df = df[(df['year'] == season) & (df['pos'].isin(['RB', 'WR', 'TE']))]
-        df = df.groupby(['abbr', 'year', 'player_name', 'pos', 'pid']).filter(lambda x: x['off_pct'].mean() > 0.4)
+        df: pd.DataFrame = df[(df['year'] == season) & (df['pos'].isin(['RB', 'WR', 'TE']))]
+        df = df.sort_values('game_date').groupby(['abbr', 'year', 'player_name', 'pos', 'pid']).filter(lambda x: x.tail(3)['off_pct'].mean() > 0.3)
         df = df[['abbr', 'player_name', 'pos', 'pid']].reset_index(drop=True).drop_duplicates(subset=['pid'])
         df = df.rename(columns={'abbr': 'team', 'pid': 'player_id', 'pos': 'position'})
         starters = pd.concat([starters, df], ignore_index=True).drop_duplicates(subset=['player_id'])
+
+        # remove players on injury report
+        injury_reports = self.data_obj.injury_reports
+        if not injury_reports.empty:
+            injured_pids = injury_reports[injury_reports['status'].isin(['Injured Reserve', 'Out'])]['pid'].unique().tolist()
+            starters = starters[~starters['player_id'].isin(injured_pids)]
 
         if positions:
             starters = starters[starters['position'].isin(positions)]
@@ -675,9 +696,9 @@ if __name__ == "__main__":
     )
     
     # Example 1: Predict for a single player (all targets)
-    # predictor.predict_single_player(pid='ChasJa00', position='WR', show=True)
+    predictor.predict_single_player(pid='HuntTr00', position='WR', show=True)
     # predictor.predict_single_player(pid='LoveJo03', position='QB', show=True)
     
     # Example 2: Predict for all starters
-    predictor.predict_next_players(predict_past_days=7)
+    # predictor.predict_next_players()
 

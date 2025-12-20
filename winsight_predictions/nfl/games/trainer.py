@@ -330,7 +330,6 @@ class GameModelTrainer:
         Returns:
             Merged DataFrame or None if loading fails
         """
-        from sklearn.feature_selection import VarianceThreshold
         
         feature_group_dir = os.path.join(self.features_dir, target)
         if not os.path.exists(feature_group_dir):

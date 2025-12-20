@@ -32,6 +32,7 @@ load_dotenv()
 try:
     from ..data_object import DataObject
     from ..const import BOVADA_BOXSCORE_MAPPINGS_NFL
+    from ..props_and_outcomes import PropsAndOutcomes
 except ImportError:
     # Get the absolute path of the directory containing the current script
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -39,10 +40,11 @@ except ImportError:
     sys.path.append(os.path.dirname(current_dir))
     from data_object import DataObject
     from const import BOVADA_BOXSCORE_MAPPINGS_NFL
+    from props_and_outcomes import PropsAndOutcomes
 
 s3 = boto3.client('s3')
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class OutcomesTrainer:
 
@@ -144,14 +146,45 @@ class OutcomesTrainer:
 
         return
     
+    def add_player_and_stat_outcome_distributions(self, df: pd.DataFrame, bovada_stat: str):
+        player_outcome_distributions = pd.read_csv(os.path.join(self.features_dir, "props_and_outcomes/all_player_outcome_distributions.csv"))
+        player_outcome_distributions['date'] = player_outcome_distributions['date'].apply(lambda x: datetime.fromisoformat(x).date())
+        stat_outcome_distributions = pd.read_csv(os.path.join(self.features_dir, "props_and_outcomes/all_stat_outcome_distributions.csv"))
+        stat_outcome_distributions['date'] = stat_outcome_distributions['date'].apply(lambda x: datetime.fromisoformat(x).date())
+
+        player_od = player_outcome_distributions[player_outcome_distributions['stat'] == bovada_stat]
+        stat_od = stat_outcome_distributions[stat_outcome_distributions['stat'] == bovada_stat]
+
+        if 'date' not in df.columns:
+            df['date'] = df['game_date'].apply(lambda x: datetime.fromisoformat(x).date())
+
+        df = df.merge(
+            player_od.rename(columns={'player_id': 'pid'}).drop(columns=['pos', 'stat']),
+            on=['pid', 'date'],
+            how='left'
+        )
+        df = df.merge(
+            stat_od.drop(columns=['stat']),
+            on=['date'],
+            how='left',
+            suffixes=('_player_od', '_stat_od')
+        )
+        df = df.drop(columns=['date'])
+        return df
+
     def concat_and_merge_train_data(self, outcomes: pd.DataFrame):
 
         temp_outcomes = outcomes[['player_id', 'bovada_date', 'stat', 'over_odds', 'under_odds', 'line_value', 'outcome']].copy()
         temp_outcomes = temp_outcomes.rename(columns={ 'player_id': 'pid' }).drop_duplicates()
         temp_outcomes['date'] = temp_outcomes['bovada_date'].apply(lambda x: x.date())
 
+        player_outcome_distributions = pd.read_csv(os.path.join(self.features_dir, "props_and_outcomes/all_player_outcome_distributions.csv"))
+        player_outcome_distributions['date'] = player_outcome_distributions['date'].apply(lambda x: datetime.fromisoformat(x).date())
+        stat_outcome_distributions = pd.read_csv(os.path.join(self.features_dir, "props_and_outcomes/all_stat_outcome_distributions.csv"))
+        stat_outcome_distributions['date'] = stat_outcome_distributions['date'].apply(lambda x: datetime.fromisoformat(x).date())
+
         for bovada_stat in os.listdir(self.features_dir):
-            if bovada_stat.startswith('train'):
+            if bovada_stat.startswith('train') or bovada_stat.startswith('props_and_outcomes'):
                 continue
 
             groupings_path = os.path.join(self.features_dir, bovada_stat)
@@ -164,6 +197,16 @@ class OutcomesTrainer:
             
             # Check if this is a combined stat
             is_combined = '&' in bovada_stat or 'and' in bovada_stat.lower()
+
+            player_od = player_outcome_distributions[player_outcome_distributions['stat'] == bovada_stat]
+            if player_od.empty:
+                logging.warning(f"No player outcome distributions found for BOVADA_STAT: {bovada_stat}")
+                continue
+
+            stat_od = stat_outcome_distributions[stat_outcome_distributions['stat'] == bovada_stat]
+            if stat_od.empty:
+                logging.warning(f"No stat outcome distributions found for BOVADA_STAT: {bovada_stat}")
+                continue
             
             if is_combined:
                 # For combined stats: concatenate by normal_stat, then merge
@@ -183,8 +226,6 @@ class OutcomesTrainer:
                             temp_df.loc[mask, 'line_value'] = outcome_row['line_value'].values[0]
                             temp_df.loc[mask, 'outcome'] = outcome_row['outcome'].values[0]
                     
-                    temp_df = temp_df.drop(columns=['date'])
-                    
                     # Group by normal_stat
                     if normal_stat not in normal_stat_groups:
                         normal_stat_groups[normal_stat] = []
@@ -195,7 +236,7 @@ class OutcomesTrainer:
                 for normal_stat, dfs in normal_stat_groups.items():
                     concatenated_dfs[normal_stat] = pd.concat(dfs, ignore_index=True)
                     logging.info(f"Concatenated {len(dfs)} files for {bovada_stat} - {normal_stat}")
-                
+
                 # Merge the concatenated dataframes
                 if len(concatenated_dfs) > 1:
                     merge_keys = ['pid', 'game_date']
@@ -205,19 +246,20 @@ class OutcomesTrainer:
                         if merged_df is None:
                             # Rename target column for first dataframe
                             df = df.rename(columns={'target': f'target_{normal_stat}'})
-                            merged_df = df
+                            merged_df: pd.DataFrame = df
                             logging.info(f"Starting merge with {normal_stat} ({len(df)} rows)")
                         else:
                             # Rename target column and drop duplicate outcome columns
                             df = df.rename(columns={'target': f'target_{normal_stat}'})
                             df_to_merge = df.drop(columns=['over_odds', 'under_odds', 'line_value', 'outcome'], errors='ignore')
-                            merged_df = merged_df.merge(df_to_merge, on=merge_keys, how='outer', suffixes=('', f'_{normal_stat}'))
+                            merged_df: pd.DataFrame = merged_df.merge(df_to_merge, on=merge_keys, how='outer', suffixes=('', f'_{normal_stat}'))
                             logging.info(f"Merged with {normal_stat} (result: {len(merged_df)} rows)")
-                    
+
                     # Save merged result
                     train_path = os.path.join(self.features_dir, 'train')
                     os.makedirs(train_path, exist_ok=True)
                     output_path = os.path.join(train_path, f"{bovada_stat}_train_data.csv")
+                    merged_df = self.add_player_and_stat_outcome_distributions(merged_df, bovada_stat)
                     merged_df.to_csv(output_path, index=False)
                     logging.info(f"Saved combined stat training data: {output_path}")
                 else:
@@ -225,7 +267,9 @@ class OutcomesTrainer:
                     train_path = os.path.join(self.features_dir, 'train')
                     os.makedirs(train_path, exist_ok=True)
                     output_path = os.path.join(train_path, f"{bovada_stat}_train_data.csv")
-                    list(concatenated_dfs.values())[0].to_csv(output_path, index=False)
+                    merged_df = list(concatenated_dfs.values())[0]
+                    merged_df = self.add_player_and_stat_outcome_distributions(merged_df, bovada_stat)
+                    merged_df.to_csv(output_path, index=False)
                     logging.info(f"Saved single stat training data: {output_path}")
             
             else:
@@ -245,16 +289,16 @@ class OutcomesTrainer:
                             temp_df.loc[mask, 'under_odds'] = outcome_row['under_odds'].values[0]
                             temp_df.loc[mask, 'line_value'] = outcome_row['line_value'].values[0]
                             temp_df.loc[mask, 'outcome'] = outcome_row['outcome'].values[0]
-                    
-                    temp_df = temp_df.drop(columns=['date'])
+
                     all_dfs.append(temp_df)
                 
                 # Concatenate all position files
                 if all_dfs:
-                    concatenated_df = pd.concat(all_dfs, ignore_index=True)
+                    concatenated_df: pd.DataFrame = pd.concat(all_dfs, ignore_index=True)
                     train_path = os.path.join(self.features_dir, 'train')
                     os.makedirs(train_path, exist_ok=True)
                     output_path = os.path.join(train_path, f"{bovada_stat}_train_data.csv")
+                    concatenated_df = self.add_player_and_stat_outcome_distributions(concatenated_df, bovada_stat)
                     concatenated_df.to_csv(output_path, index=False)
                     logging.info(f"Concatenated {len(all_dfs)} files for {bovada_stat} ({len(concatenated_df)} total rows)")
 
@@ -302,9 +346,23 @@ class OutcomesTrainer:
         """
         logging.info(f"Final feature shape for modeling: {X.shape}")
         
-        # Log top correlations
-        correlations = X.fillna(0).corrwith(y.fillna(0)).abs().sort_values(ascending=False)
+        # Remove zero-variance features to avoid division by zero in correlation calculation
+        X_filled = X.fillna(0)
+        y_filled = y.fillna(0)
+        
+        # Filter out features with zero standard deviation
+        feature_stds = X_filled.std()
+        non_zero_var_features = feature_stds[feature_stds > 0].index.tolist()
+        X_filtered = X_filled[non_zero_var_features]
+        
+        # Log top correlations (suppress numpy warnings about NaN in correlations)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            correlations = X_filtered.corrwith(y_filled).abs()
+        correlations = correlations.dropna().sort_values(ascending=False)
         logging.info(f"Top 10 feature correlations with target:\n{correlations.head(10)}")
+        
+        # Use filtered features for training
+        X = X_filtered
         
         # Train/test split
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -370,16 +428,30 @@ class OutcomesTrainer:
         del X_train, X_test, X_train_scaled, X_test_scaled
 
     def train_models(self):
-        # outcomes = self.get_outcomes()
+        outcomes = self.get_outcomes()
         # outcomes.to_csv("nfl_outcomes_with_pids.csv", index=False)
 
-        outcomes = pd.read_csv("nfl_outcomes_with_pids.csv")
-        outcomes['bovada_date'] = outcomes['bovada_date'].apply(datetime.fromisoformat)
-        outcomes['date_collected'] = outcomes['date_collected'].apply(datetime.fromisoformat)
+        # outcomes = pd.read_csv("nfl_outcomes_with_pids.csv")
+        # outcomes['bovada_date'] = outcomes['bovada_date'].apply(datetime.fromisoformat)
+        # outcomes['date_collected'] = outcomes['date_collected'].apply(datetime.fromisoformat)
 
-        # self.write_merged_groupings(outcomes)
+        props_and_outcomes_dir = os.path.join(self.features_dir, "props_and_outcomes/")
+        os.makedirs(props_and_outcomes_dir, exist_ok=True)
 
-        # self.concat_and_merge_train_data(outcomes)
+        props_and_outcomes = PropsAndOutcomes(
+            _dir=props_and_outcomes_dir,
+            league="nfl",
+            props_df=None,
+            outcomes_df=outcomes,
+            data_obj=self.data_obj
+        )
+
+        props_and_outcomes.get_past_player_outcome_distributions()
+        props_and_outcomes.get_past_stat_outcome_distributions()
+
+        self.write_merged_groupings(outcomes)
+
+        self.concat_and_merge_train_data(outcomes)
 
         for bovada_stat in outcomes['stat'].unique():
             train_data_path = os.path.join(self.features_dir, "train/", f"{bovada_stat}_train_data.csv")

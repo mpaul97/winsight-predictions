@@ -4,11 +4,21 @@ from dataclasses import dataclass, field
 import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
-
+import os
 import numpy as np
 import pandas as pd
 from pandas import DataFrame
 from pandas.api.typing import DataFrameGroupBy
+import sys
+
+try:
+	from ..const import NFL_GAME_STATUS_SNAP_REDUCERS, NFL_PRACTICE_STATUS_SNAP_REDUCERS
+except ImportError:
+    # Get the absolute path of the directory containing the current script
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    # Add the parent directory to sys.path
+    sys.path.append(os.path.dirname(current_dir))
+    from const import NFL_GAME_STATUS_SNAP_REDUCERS, NFL_PRACTICE_STATUS_SNAP_REDUCERS
 
 @dataclass
 class FeatureEngine:
@@ -29,6 +39,8 @@ class FeatureEngine:
 	player_group_ranks: Dict[str, DataFrame] = field(default_factory=dict)
 	advanced_stat_cols: Dict[str, List[str]] = field(default_factory=dict)
 	big_play_stat_columns: List[str] = field(default_factory=list)
+	injury_reports: DataFrame = field(default_factory=pd.DataFrame)
+	schedules: DataFrame = field(default_factory=pd.DataFrame)
 
 	# --- Config / metadata ---
 	feature_dependencies: Dict[str, List[str]] = field(default_factory=lambda: {
@@ -443,6 +455,8 @@ class FeatureEngine:
 			pg = self.prior_games
 			row = self.row
 			d: Dict[str, Any] = {}
+
+			pg = self.schedules[['week', 'year']].drop_duplicates().merge(pg, on=['week', 'year'], how='left')
 			
 			# For training: use actual snap counts
 			if 'off_pct' in pg.columns:
@@ -476,6 +490,7 @@ class FeatureEngine:
 				if self.predicted_features is not None:  # We're predicting
 					logging.debug(f"Calculating snap count prediction for player {row.get('pid', 'unknown')}")
 					# Fill missing off_pct with 0 for healthy players who didn't play
+
 					off_pct_series = pg['off_pct'].fillna(0)
 					
 					# Calculate prediction: average of (last 5 avg, last game * 1.2)
@@ -490,6 +505,25 @@ class FeatureEngine:
 					if 'starter' in row.index and row.get('starter', 0) == 1:
 						final_pred = np.clip(final_pred + 0.15, 0.0, 1.0)
 					
+					# Adjust for injury reports if available
+					if not self.injury_reports.empty and 'pid' in row.index:
+						player_injuries: pd.DataFrame = self.injury_reports[self.injury_reports['pid'] == row['pid']].fillna('')
+
+						if not player_injuries.empty:
+							injury_status = player_injuries.iloc[0]['status']
+							if injury_status in NFL_GAME_STATUS_SNAP_REDUCERS:
+								reducer = NFL_GAME_STATUS_SNAP_REDUCERS[injury_status]
+								logging.debug(f"Adjusting snap prediction for injury status '{injury_status}' with reducer {reducer}")
+								final_pred -= reducer
+								final_pred = np.clip(final_pred, 0.0, 1.0)
+
+							practice_status = player_injuries.iloc[0]['practice_status']
+							if practice_status in NFL_PRACTICE_STATUS_SNAP_REDUCERS:
+								reducer = NFL_PRACTICE_STATUS_SNAP_REDUCERS[practice_status]
+								logging.debug(f"Adjusting snap prediction for practice status '{practice_status}' with reducer {reducer}")
+								final_pred -= reducer
+								final_pred = np.clip(final_pred, 0.0, 1.0)
+
 					d['snap_current_game'] = round(final_pred, 4)
 				else:
 					logging.debug(f"Using actual snap count for training for player {row.get('player_name', 'unknown')}")

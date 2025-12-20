@@ -33,6 +33,8 @@ load_dotenv()
 try:
     from ..data_object import DataObject
     from ..const import BOVADA_BOXSCORE_MAPPINGS_NFL
+    from ..helpers import get_dynamo_table_dataframe
+    from ..props_and_outcomes import PropsAndOutcomes
 except ImportError:
     # Get the absolute path of the directory containing the current script
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -40,34 +42,28 @@ except ImportError:
     sys.path.append(os.path.dirname(current_dir))
     from data_object import DataObject
     from const import BOVADA_BOXSCORE_MAPPINGS_NFL
+    from helpers import get_dynamo_table_dataframe
+    from props_and_outcomes import PropsAndOutcomes
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-resource = boto3.resource("dynamodb")
-
-def get_dynamo_table_dataframe(table_name: str):
-    return wr.dynamodb.read_partiql_query(
-        query=f"""
-            SELECT * 
-            FROM {table_name}
-        """
-    )
-
 class OutcomesPredictor:
-    def __init__(self, data_obj: DataObject, root_dir: str = "./", local_path: Optional[str] = None, player_features_dir: Optional[str] = None):
+    def __init__(self, data_obj: DataObject, root_dir: str = "./", local_props_path: Optional[str] = None, player_features_dir: Optional[str] = None, predictions_bucket_name: Optional[str] = None):
         self.data_obj = data_obj
         self.root_dir = root_dir
-        self.local_path = local_path
+        self.local_props_path = local_props_path
         self.player_features_dir = player_features_dir
+        self.predictions_bucket_name = predictions_bucket_name
         self.features_dir = os.path.join(self.root_dir, "predicted_features/")
         self.models_dir = os.path.join(self.root_dir, "models/")
         self.outcome_predictions_dir = os.path.join(self.root_dir, "outcome_predictions/")
-        if self.local_path:
-            os.makedirs(self.features_dir, exist_ok=True)
+        os.makedirs(self.features_dir, exist_ok=True)
+        os.makedirs(self.outcome_predictions_dir, exist_ok=True)
+        if self.local_props_path:
             os.makedirs(self.models_dir, exist_ok=True)
-            os.makedirs(self.outcome_predictions_dir, exist_ok=True)
-            self.player_train_features_path = os.path.join(self.root_dir, "players/predicted_features/")
-        else:
+            self.player_train_features_path = os.path.join(self.root_dir, "../players/predicted_features/")
+        
+        if self.data_obj.storage_mode == 's3':
             self.player_train_features_path = os.path.join(self.player_features_dir, "predicted_features/")
 
         self.skill_positions = ['QB', 'RB', 'WR', 'TE']
@@ -78,6 +74,27 @@ class OutcomesPredictor:
         self.pid_position_mappings = self.player_snaps[['pid', 'pos']].drop_duplicates().set_index('pid').to_dict()['pos']
 
         return
+    
+    def _load_model_from_s3(self, s3_key: str, s3_client) -> Optional[Any]:
+        """Load a model file from S3.
+        
+        Args:
+            bucket: S3 bucket name
+            s3_key: S3 object key
+            s3_client: boto3 S3 client
+            
+        Returns:
+            Loaded model object or None if failed
+        """
+        bucket_name = os.getenv(self.predictions_bucket_name)
+        try:
+            response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+            model_bytes = response['Body'].read()
+            model_bundle = joblib.load(BytesIO(model_bytes))
+            return model_bundle
+        except Exception as e:
+            logging.warning(f"Failed loading s3://{bucket_name}/{s3_key}: {e}")
+            return None
     
     def best_match(self, name: str):
         try:
@@ -100,8 +117,8 @@ class OutcomesPredictor:
         return df
 
     def get_props(self):
-        if self.local_path:
-            df = pd.read_csv(f"{self.local_path}nfl_props.csv")
+        if self.local_props_path:
+            df = pd.read_csv(f"{self.local_props_path}nfl_props.csv")
         else: # load from s3
             df = get_dynamo_table_dataframe(table_name='nfl_props')
 
@@ -132,11 +149,12 @@ class OutcomesPredictor:
                 continue
 
             if normal_stats:
-                logging.info(f"Writing merged feature groups for: {bovada_stat}, {positions}, {normal_stats}")
                 for normal_stat in normal_stats:
                     for pos in positions:
                         features_path = os.path.join(self.player_train_features_path, pos, normal_stat)
+                        logging.info(f"Writing merged feature groups for: {bovada_stat}, {features_path}")
                         if os.path.exists(features_path):
+                            logging.info(f"Merging features from: {features_path}")
                             merged_df = pd.DataFrame()
                             for fn in os.listdir(features_path):
                                 temp_df = pd.read_csv(f"{features_path}/{fn}")
@@ -158,6 +176,27 @@ class OutcomesPredictor:
 
         return
     
+    def add_player_and_stat_outcome_distributions(self, df: pd.DataFrame, bovada_stat: str):
+        player_outcome_distributions = pd.read_csv(os.path.join(self.features_dir, "props_and_outcomes/pivoted_player_outcome_distributions.csv"))
+        stat_outcome_distributions = pd.read_csv(os.path.join(self.features_dir, "props_and_outcomes/pivoted_stat_outcome_distributions.csv"))
+
+        player_od = player_outcome_distributions[player_outcome_distributions['stat'] == bovada_stat]
+        stat_od = stat_outcome_distributions[stat_outcome_distributions['stat'] == bovada_stat]
+
+        df = df.merge(
+            player_od.rename(columns={'player_id': 'pid'}).drop(columns=['player_name', 'stat']).rename(columns={ col: f"{col}_player_od" for col in player_od.columns if col not in ['pid'] }),
+            on=['pid'],
+            how='left'
+        )
+        
+        # Add stat-level outcome distributions (same for all rows)
+        if not stat_od.empty:
+            stat_od_row = stat_od.drop(columns=['stat']).iloc[0]
+            for col in stat_od_row.index:
+                df[f"{col}_stat_od"] = stat_od_row[col]
+        
+        return df
+
     def concat_and_merge_predict_data(self, props: pd.DataFrame):
         """Concatenate and merge prediction data, similar to trainer."""
 
@@ -166,7 +205,7 @@ class OutcomesPredictor:
         temp_props['date'] = temp_props['bovada_date'].apply(lambda x: x.date())
 
         for bovada_stat in os.listdir(self.features_dir):
-            if bovada_stat.startswith('predict'):
+            if bovada_stat.startswith('predict') or bovada_stat.startswith('props_and_outcomes'):
                 continue
             
             groupings_path = os.path.join(self.features_dir, bovada_stat)
@@ -185,24 +224,28 @@ class OutcomesPredictor:
                 normal_stat_groups = {}
                 
                 for fn in files:
-                    normal_stat, position = fn.split("-")[0], fn.split("-")[1]
-                    temp_df = pd.read_csv(os.path.join(groupings_path, fn), low_memory=False)
-                    temp_df['date'] = temp_df['game_date'].apply(lambda x: datetime.fromisoformat(x).date())
-                    
-                    # Add prop data (odds and line values)
-                    for (pid, date), prop_row in temp_props[temp_props['stat'] == bovada_stat].groupby(['pid', 'date']):
-                        mask = (temp_df['pid'] == pid) & (temp_df['date'] == date)
-                        if mask.any():
-                            temp_df.loc[mask, 'over_odds'] = prop_row['over_odds'].values[0]
-                            temp_df.loc[mask, 'under_odds'] = prop_row['under_odds'].values[0]
-                            temp_df.loc[mask, 'line_value'] = prop_row['line_value'].values[0]
-                    
-                    temp_df = temp_df.drop(columns=['date'])
-                    
-                    # Group by normal_stat
-                    if normal_stat not in normal_stat_groups:
-                        normal_stat_groups[normal_stat] = []
-                    normal_stat_groups[normal_stat].append(temp_df)
+                    try:
+                        normal_stat, position = fn.split("-")[0], fn.split("-")[1]
+                        temp_df = pd.read_csv(os.path.join(groupings_path, fn), low_memory=False)
+                        temp_df['date'] = temp_df['game_date'].apply(lambda x: datetime.fromisoformat(x).date())
+                        
+                        # Add prop data (odds and line values)
+                        for (pid, date), prop_row in temp_props[temp_props['stat'] == bovada_stat].groupby(['pid', 'date']):
+                            mask = (temp_df['pid'] == pid) & (temp_df['date'] == date)
+                            if mask.any():
+                                temp_df.loc[mask, 'over_odds'] = prop_row['over_odds'].values[0]
+                                temp_df.loc[mask, 'under_odds'] = prop_row['under_odds'].values[0]
+                                temp_df.loc[mask, 'line_value'] = prop_row['line_value'].values[0]
+                        
+                        temp_df = temp_df.drop(columns=['date'])
+                        
+                        # Group by normal_stat
+                        if normal_stat not in normal_stat_groups:
+                            normal_stat_groups[normal_stat] = []
+                        normal_stat_groups[normal_stat].append(temp_df)
+                    except Exception as e:
+                        logging.error(f"Error processing file {fn} for {bovada_stat}: {e}")
+                        continue
                 
                 # Concatenate files with same normal_stat
                 concatenated_dfs = {}
@@ -228,6 +271,7 @@ class OutcomesPredictor:
                     predict_path = os.path.join(self.features_dir, 'predict')
                     os.makedirs(predict_path, exist_ok=True)
                     output_path = os.path.join(predict_path, f"{bovada_stat}_predict_data.csv")
+                    merged_df = self.add_player_and_stat_outcome_distributions(merged_df, bovada_stat)
                     merged_df.to_csv(output_path, index=False)
                     logging.info(f"Saved combined stat prediction data: {output_path}")
                 else:
@@ -235,28 +279,37 @@ class OutcomesPredictor:
                     predict_path = os.path.join(self.features_dir, 'predict')
                     os.makedirs(predict_path, exist_ok=True)
                     output_path = os.path.join(predict_path, f"{bovada_stat}_predict_data.csv")
-                    list(concatenated_dfs.values())[0].to_csv(output_path, index=False)
-                    logging.info(f"Saved single stat prediction data: {output_path}")
+                    try:
+                        merged_df = self.add_player_and_stat_outcome_distributions(list(concatenated_dfs.values())[0], bovada_stat)
+                        merged_df.to_csv(output_path, index=False)
+                        logging.info(f"Saved single stat prediction data: {output_path}")
+                    except Exception as e:
+                        logging.error(f"Error saving single stat data for {bovada_stat}: {e}")
+                        continue
             
             else:
                 # For simple stats: concatenate all files across positions
                 all_dfs = []
                 
                 for fn in files:
-                    normal_stat, position = fn.split("-")[0], fn.split("-")[1]
-                    temp_df = pd.read_csv(os.path.join(groupings_path, fn), low_memory=False)
-                    temp_df['date'] = temp_df['game_date'].apply(lambda x: datetime.fromisoformat(x).date())
-                    
-                    # Add prop data (odds and line values)
-                    for (pid, date), prop_row in temp_props[temp_props['stat'] == bovada_stat].groupby(['pid', 'date']):
-                        mask = (temp_df['pid'] == pid) & (temp_df['date'] == date)
-                        if mask.any():
-                            temp_df.loc[mask, 'over_odds'] = prop_row['over_odds'].values[0]
-                            temp_df.loc[mask, 'under_odds'] = prop_row['under_odds'].values[0]
-                            temp_df.loc[mask, 'line_value'] = prop_row['line_value'].values[0]
-                    
-                    temp_df = temp_df.drop(columns=['date'])
-                    all_dfs.append(temp_df)
+                    try:
+                        normal_stat, position = fn.split("-")[0], fn.split("-")[1]
+                        temp_df = pd.read_csv(os.path.join(groupings_path, fn), low_memory=False)
+                        temp_df['date'] = temp_df['game_date'].apply(lambda x: datetime.fromisoformat(x).date())
+                        
+                        # Add prop data (odds and line values)
+                        for (pid, date), prop_row in temp_props[temp_props['stat'] == bovada_stat].groupby(['pid', 'date']):
+                            mask = (temp_df['pid'] == pid) & (temp_df['date'] == date)
+                            if mask.any():
+                                temp_df.loc[mask, 'over_odds'] = prop_row['over_odds'].values[0]
+                                temp_df.loc[mask, 'under_odds'] = prop_row['under_odds'].values[0]
+                                temp_df.loc[mask, 'line_value'] = prop_row['line_value'].values[0]
+                        
+                        temp_df = temp_df.drop(columns=['date'])
+                        all_dfs.append(temp_df)
+                    except Exception as e:
+                        logging.error(f"Error processing file {fn} for {bovada_stat}: {e}")
+                        continue
                 
                 # Concatenate all position files
                 if all_dfs:
@@ -264,6 +317,7 @@ class OutcomesPredictor:
                     predict_path = os.path.join(self.features_dir, 'predict')
                     os.makedirs(predict_path, exist_ok=True)
                     output_path = os.path.join(predict_path, f"{bovada_stat}_predict_data.csv")
+                    concatenated_df = self.add_player_and_stat_outcome_distributions(concatenated_df, bovada_stat)
                     concatenated_df.to_csv(output_path, index=False)
                     logging.info(f"Concatenated {len(all_dfs)} files for {bovada_stat} ({len(concatenated_df)} total rows)")
 
@@ -281,14 +335,27 @@ class OutcomesPredictor:
 
             # Load model bundle
             model_path = os.path.join(self.models_dir, f"{bovada_stat}_model.pkl")
-            if not os.path.exists(model_path):
+            if not os.path.exists(model_path) and self.data_obj.storage_mode == 'local':
                 logging.warning(f"No model found for bovada_stat: {bovada_stat}")
                 continue
 
-            model_bundle = joblib.load(model_path)
-            model = model_bundle['model']
-            scaler = model_bundle['scaler']
-            feature_names = model_bundle['feature_names']
+            if self.data_obj.storage_mode == 'local':
+                model_bundle = joblib.load(model_path)
+                model = model_bundle['model']
+                scaler = model_bundle['scaler']
+                feature_names = model_bundle['feature_names']
+            else:  # load from s3
+                s3_client = boto3.client('s3')
+                model_bundle = self._load_model_from_s3(
+                    s3_key=f"nfl/outcomes/{bovada_stat}_model.pkl",
+                    s3_client=s3_client
+                )
+                if model_bundle is None:
+                    logging.warning(f"Failed to load model bundle for {bovada_stat} from S3")
+                    continue
+                model = model_bundle['model']
+                scaler = model_bundle['scaler']
+                feature_names = model_bundle['feature_names']
 
             # Load prediction data
             predict_df = pd.read_csv(predict_data_path, low_memory=False)
@@ -326,8 +393,8 @@ class OutcomesPredictor:
             
             if missing_cols:
                 logging.warning(f"Missing features for {bovada_stat}: {missing_cols}")
-                for col in missing_cols:
-                    X[col] = 0
+                missing_df = pd.DataFrame(0, index=X.index, columns=list(missing_cols))
+                X = pd.concat([X, missing_df], axis=1)
                     
             if extra_cols:
                 logging.info(f"Extra features (will be dropped) for {bovada_stat}: {extra_cols}")
@@ -361,6 +428,10 @@ class OutcomesPredictor:
             all_predictions = all_predictions.dropna(subset=['over_odds', 'under_odds', 'line_value'], how='all')
             all_predictions = all_predictions.drop_duplicates(subset=['pid', 'game_date', 'stat'])
 
+            if all_predictions.empty:
+                logging.warning("No valid predictions after filtering for odds/line values")
+                return pd.DataFrame()
+
             # Merge back with original props data for player names
             all_predictions = all_predictions.merge(
                 target_props[['player_id', 'player_name', 'bovada_date', 'stat']].rename(columns={'player_id': 'pid'}),
@@ -387,6 +458,20 @@ class OutcomesPredictor:
         # Filter to recent/upcoming props (1 day buffer)
         target_props = props[props['bovada_date'] >= datetime.now() - timedelta(days=1)].copy()
 
+        props_and_outcomes_dir = os.path.join(self.features_dir, "props_and_outcomes/")
+        os.makedirs(props_and_outcomes_dir, exist_ok=True)
+
+        props_and_outcomes = PropsAndOutcomes(
+            _dir=props_and_outcomes_dir,
+            league="nfl",
+            props_df=props,
+            outcomes_df=None,
+            data_obj=self.data_obj
+        )
+
+        props_and_outcomes.get_player_outcome_distributions()
+        props_and_outcomes.get_stat_outcome_distributions()
+
         self.write_merged_groupings(target_props)
 
         self.concat_and_merge_predict_data(target_props)
@@ -402,10 +487,10 @@ if __name__ == "__main__":
     #     local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
     # )
     
-    # local_path = "/Users/michaelpaul/Library/CloudStorage/GoogleDrive-michaelandrewpaul97@gmail.com/My Drive/python/winsight_api/dynamo_to_s3/data/"
+    # local_props_path = "/Users/michaelpaul/Library/CloudStorage/GoogleDrive-michaelandrewpaul97@gmail.com/My Drive/python/winsight_api/dynamo_to_s3/data/"
     # predictor = OutcomesPredictor(
     #     data_obj=data_obj,
-    #     local_path=local_path
+    #     local_props_path=local_props_path,
     # )
 
     data_obj = DataObject(
@@ -416,7 +501,8 @@ if __name__ == "__main__":
     predictor = OutcomesPredictor(
         data_obj=data_obj,
         root_dir="./",
-        player_features_dir="../players/predicted_features/"
+        player_features_dir="../players/predicted_features/",
+        predictions_bucket_name='LEAGUE_PREDICTIONS_BUCKET_NAME'
     )
     
     predictor.predict_next_props()

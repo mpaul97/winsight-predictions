@@ -32,8 +32,9 @@ classifiers = [
 ]
 
 [tool.setuptools]
-packages = ["winsight_predictions", "winsight_predictions.nfl", "winsight_predictions.nfl.games", "winsight_predictions.nfl.players", "winsight_predictions.nba", "winsight_predictions.mlb"]
+packages = ["winsight_predictions", "winsight_predictions.nfl", "winsight_predictions.nfl.games", "winsight_predictions.nfl.players", "winsight_predictions.nfl.outcomes", "winsight_predictions.nba", "winsight_predictions.mlb"]
 
 [tool.setuptools.package-data]
 "winsight_predictions.nfl.games" = ["models/*.json"]
 "winsight_predictions.nfl.players" = ["models/**/*.json"]
+"winsight_predictions.nfl.outcomes" = ["models/*.json"]

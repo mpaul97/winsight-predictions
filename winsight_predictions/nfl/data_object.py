@@ -94,52 +94,6 @@ class DataObject:
             if not self.s3_bucket:
                 logging.warning("S3 bucket name not provided or env SPORTS_DATA_BUCKET_NAME missing.")
             self._s3 = s3_client or boto3.client("s3")
-
-        # --- Unified helpers ---
-        def _read_csv(path: str, **kwargs) -> pd.DataFrame:
-            if self.storage_mode == "local":
-                return pd.read_csv(path, **kwargs)
-            # S3 path treated as key
-            try:
-                resp = self._s3.get_object(Bucket=self.s3_bucket, Key=path)
-                content = resp["Body"].read().decode("utf-8")
-                return pd.read_csv(StringIO(content), **kwargs)
-            except Exception as e:
-                logging.error(f"Error reading S3 CSV {path}: {e}")
-                return pd.DataFrame()
-
-        def _listdir(prefix_or_path: str) -> List[str]:
-            if self.storage_mode == "local":
-                if not os.path.exists(prefix_or_path):
-                    return []
-                return sorted(os.listdir(prefix_or_path))
-            # S3 listing
-            keys: List[str] = []
-            continuation: Optional[str] = None
-            while True:
-                params = {"Bucket": self.s3_bucket, "Prefix": prefix_or_path}
-                if continuation:
-                    params["ContinuationToken"] = continuation
-                try:
-                    resp = self._s3.list_objects_v2(**params)
-                except Exception as e:
-                    logging.error(f"Error listing S3 prefix {prefix_or_path}: {e}")
-                    break
-                for obj in resp.get("Contents", []):
-                    key = obj["Key"]
-                    if key.endswith("/"):  # skip 'directories'
-                        continue
-                    # Extract filename portion relative to prefix
-                    filename = key[len(prefix_or_path):] if key.startswith(prefix_or_path) else key
-                    if filename:
-                        keys.append(filename)
-                continuation = resp.get("NextContinuationToken")
-                if not continuation:
-                    break
-            return sorted(keys)
-
-        self._read_csv = _read_csv
-        self._listdir = _listdir
         
         # Rank configurations
         self.team_rank_configs = [
@@ -200,6 +154,54 @@ class DataObject:
         logging.info(f"Initialized DataObject for {league.upper()}")
     
     # ====================================================================
+    # UNIFIED HELPERS (instance methods for pickling compatibility)
+    # ====================================================================
+    
+    def _read_csv(self, path: str, **kwargs) -> pd.DataFrame:
+        """Read CSV from local filesystem or S3."""
+        if self.storage_mode == "local":
+            return pd.read_csv(path, **kwargs)
+        # S3 path treated as key
+        try:
+            resp = self._s3.get_object(Bucket=self.s3_bucket, Key=path)
+            content = resp["Body"].read().decode("utf-8")
+            return pd.read_csv(StringIO(content), **kwargs)
+        except Exception as e:
+            logging.error(f"Error reading S3 CSV {path}: {e}")
+            return pd.DataFrame()
+
+    def _listdir(self, prefix_or_path: str) -> List[str]:
+        """List files in directory (local) or S3 prefix."""
+        if self.storage_mode == "local":
+            if not os.path.exists(prefix_or_path):
+                return []
+            return sorted(os.listdir(prefix_or_path))
+        # S3 listing
+        keys: List[str] = []
+        continuation: Optional[str] = None
+        while True:
+            params = {"Bucket": self.s3_bucket, "Prefix": prefix_or_path}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            try:
+                resp = self._s3.list_objects_v2(**params)
+            except Exception as e:
+                logging.error(f"Error listing S3 prefix {prefix_or_path}: {e}")
+                break
+            for obj in resp.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/"):  # skip 'directories'
+                    continue
+                # Extract filename portion relative to prefix
+                filename = key[len(prefix_or_path):] if key.startswith(prefix_or_path) else key
+                if filename:
+                    keys.append(filename)
+            continuation = resp.get("NextContinuationToken")
+            if not continuation:
+                break
+        return sorted(keys)
+    
+    # ====================================================================
     # SCHEDULES
     # ====================================================================
     
@@ -215,7 +217,7 @@ class DataObject:
         logging.info("Loading schedules...")
         df = pd.DataFrame()
         
-        if not os.path.exists(self.local_schedules_dir):
+        if not os.path.exists(self.local_schedules_dir) and self.storage_mode == "local":
             logging.warning(f"Schedules directory not found: {self.local_schedules_dir}")
             return df
         
@@ -278,7 +280,7 @@ class DataObject:
         """Load most recent preview file."""
         logging.info("Loading previews...")
         
-        if not os.path.exists(self.previews_dir):
+        if not os.path.exists(self.previews_dir) and self.storage_mode == "local":
             logging.warning(f"Previews directory not found: {self.previews_dir}")
             return pd.DataFrame()
         
@@ -289,7 +291,7 @@ class DataObject:
         
         fn = f"{self.previews_dir}/{fns[0]}"
         try:
-            df = self._read_csv(fn)
+            df = self._read_csv(fn.replace("//", "/"))
             df = df.rename(columns={'ou': 'over_under'})
             
             if 'game_date' in df.columns:
@@ -320,6 +322,40 @@ class DataObject:
             logging.error(f"Error loading previews from {fn}: {e}")
             return pd.DataFrame()
     
+    # ====================================================================
+    # INJURY REPORTS
+    # ====================================================================
+    @property
+    def injury_reports(self) -> pd.DataFrame:
+        """Load and cache injury reports data."""
+        if 'injury_reports' not in self._cache:
+            self._cache['injury_reports'] = self._load_injury_reports()
+        return self._cache['injury_reports']
+    
+    def _load_injury_reports(self) -> pd.DataFrame:
+        """Load all injury report files from local directory."""
+        df = pd.DataFrame()
+        
+        if not os.path.exists(self.local_injury_dir) and self.storage_mode == "local":
+            logging.warning(f"Injury reports directory not found: {self.local_injury_dir}")
+            return df
+        
+        fns = sorted(self._listdir(self.local_injury_dir), reverse=True)
+        if not fns:
+            logging.warning("No injury report files found")
+            return pd.DataFrame()
+        
+        fn = f"{self.local_injury_dir}/{fns[0]}"
+        try:
+            logging.info(f"Loading injury reports from {fn}...")
+            df = self._read_csv(fn.replace("//", "/"))
+        except Exception as e:
+            logging.error(f"Error loading injury reports from {fn}: {e}")
+            return pd.DataFrame()
+        
+        logging.info(f"Loaded {len(df)} injury report records")
+        return df
+
     # ====================================================================
     # STARTERS
     # ====================================================================
@@ -360,7 +396,7 @@ class DataObject:
         """Load most recent starters file."""
         logging.info("Loading new starters...")
         
-        if not os.path.exists(self.starters_dir):
+        if not os.path.exists(self.starters_dir) and self.storage_mode == "local":
             logging.warning(f"Starters directory not found: {self.starters_dir}")
             return pd.DataFrame()
         
@@ -371,7 +407,7 @@ class DataObject:
         
         fn = f"{self.starters_dir}/{fns[0]}"
         try:
-            df = self._read_csv(fn)
+            df = self._read_csv(fn.replace("//", "/"))
             logging.info(f"Loaded new starters from {fn}")
             return df
         except Exception as e:
@@ -703,7 +739,7 @@ class DataObject:
         logging.info("Loading PBP features...")
         pbp_dict = {}
         
-        if not os.path.exists(self.local_pbp_features_dir):
+        if not os.path.exists(self.local_pbp_features_dir) and self.storage_mode == "local":
             logging.warning(f"PBP features directory not found: {self.local_pbp_features_dir}")
             return pbp_dict
         
@@ -798,7 +834,7 @@ class DataObject:
         
         df = pd.DataFrame()
         
-        if not os.path.exists(local_dir):
+        if not os.path.exists(local_dir) and self.storage_mode == "local":
             logging.warning(f"Team ranks directory not found: {local_dir}")
             return df
         
@@ -856,7 +892,7 @@ class DataObject:
         
         df = pd.DataFrame()
         
-        if not os.path.exists(local_dir):
+        if not os.path.exists(local_dir) and self.storage_mode == "local":
             logging.warning(f"Player group ranks directory not found: {local_dir}")
             return df
         
@@ -2059,16 +2095,13 @@ class DataObject:
         return self._listdir(directory_or_prefix)
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
     # Example usage
     data_obj = DataObject(
         league='nfl',
-        storage_mode='local',
-        local_root=os.path.join(sys.path[0], "..", "..", "..", 'sports-data-storage-copy')
+        storage_mode='s3',
+        s3_bucket=os.getenv("SPORTS_DATA_BUCKET_NAME")
     )
-    df = data_obj.previews
-    print(df)
-    # position, target = 'QB', 'passing_yards'
-    # pos_df = df[df['pos'] == position]
-    # total_players = len(pos_df['pid'].unique())
-    
-    # logging.info(f"Training {position}_{target} with {total_players} players")
+    df = data_obj.injury_reports
+    print(df.head())

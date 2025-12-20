@@ -6,6 +6,7 @@ recursive-include winsight_predictions *.py
 # Include only model metrics (exclude all training data CSVs)
 include winsight_predictions/nfl/games/models/*.json
 include winsight_predictions/nfl/players/models/**/*.json
+include winsight_predictions/nfl/outcomes/models/*.json
 
 # Exclude everything else
 recursive-exclude winsight_predictions *.csv
