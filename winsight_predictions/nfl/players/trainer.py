@@ -874,7 +874,7 @@ if __name__ == "__main__":
         storage_mode='local',
         local_root=os.path.join(sys.path[0], "..", "..", "..", "..", "sports-data-storage-copy/")
     )
-    trainer = PlayerModelTrainer(data_obj, use_residual_training=True)
+    trainer = PlayerModelTrainer(data_obj, use_residual_training=False)
 
     # trainer.create_feature_groupings(position='QB')
     
@@ -883,4 +883,4 @@ if __name__ == "__main__":
 
     # trainer.train_models()
 
-    # trainer.upload_models_to_s3()
+    trainer.upload_models_to_s3()

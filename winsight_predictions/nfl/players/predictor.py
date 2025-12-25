@@ -373,8 +373,9 @@ class PlayerPredictor:
             X_pred = X_pred[feature_names]
         
         X_pred = X_pred.fillna(0.0)
-        if target == 'fantasy_points':
-            X_pred[[col for col in X_pred.columns if 'snap' in col]].to_csv('debug_player_pred_features.csv', index=False)  # Debugging line
+        if target == 'passing_yards':
+            data = json.loads(X_pred[[col for col in X_pred.columns]].iloc[0].to_json())
+            json.dump(data, open("debug_passing_yards_features.json", "w"), indent=4)
         # Scale and predict
         scaler = self.scalers.get(model_key)
         if scaler is not None:
@@ -419,9 +420,10 @@ class PlayerPredictor:
             # Denormalize: actual_prediction = residual_prediction + player_baseline
             prediction = prediction + player_baseline
             
-            logging.debug(f"Denormalized residual prediction for {pid} {target}: "
+            logging.info(f"Denormalized residual prediction for {pid} {target}: "
                          f"residual={prediction - player_baseline:.2f}, baseline={player_baseline:.2f}, "
-                         f"final={prediction:.2f}")
+                         f"final={prediction:.2f}, "
+                         f"Global Mean: {global_mean:.2f}")
         
         return prediction, snap_prediction
     
@@ -696,8 +698,8 @@ if __name__ == "__main__":
     )
     
     # Example 1: Predict for a single player (all targets)
-    predictor.predict_single_player(pid='HuntTr00', position='WR', show=True)
-    # predictor.predict_single_player(pid='LoveJo03', position='QB', show=True)
+    # predictor.predict_single_player(pid='HuntTr00', position='WR', show=True)
+    predictor.predict_single_player(pid='LoveJo03', position='QB', show=True)
     
     # Example 2: Predict for all starters
     # predictor.predict_next_players()

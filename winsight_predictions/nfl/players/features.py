@@ -128,10 +128,14 @@ class FeatureEngine:
 		if key in self.last_game_sim_cache:
 			return self.last_game_sim_cache[key]
 		try:
-			opp_last_data: DataFrameGroupBy = self.player_data[
-				(self.player_data['game_date'] < date) &
-				(self.player_data['abbr'] == opp_abbr) &
-				(self.player_data['pos'] == position)
+			pos_data = self.player_data.copy()[self.player_data['pos'] == position]
+			opp_last_game_key = pos_data[
+				(pos_data['game_date'] < date) & 
+				(pos_data['abbr'] == opp_abbr)
+			].sort_values(by='game_date', ascending=False)['key'].iloc[0]
+			opp_last_data: DataFrameGroupBy = pos_data[
+				(pos_data['key'] == opp_last_game_key)& 
+				(pos_data['abbr'] != opp_abbr)
 			].groupby('key')
 			last_group_key = sorted(opp_last_data.groups.keys())[-1]
 			last_group_df: DataFrame = opp_last_data.get_group(last_group_key)
@@ -294,6 +298,7 @@ class FeatureEngine:
 			n_rows = len(df)
 			# Vectorized: get all stats at once using numpy array operations
 			stats_array = df[self.big_play_stat_columns].values
+			stats_array = np.nan_to_num(stats_array, nan=0.0)
 			
 			# Single aggregation operations
 			last_game_vals = stats_array[-1] if n_rows > 0 else np.zeros(len(self.big_play_stat_columns))
@@ -456,7 +461,7 @@ class FeatureEngine:
 			row = self.row
 			d: Dict[str, Any] = {}
 
-			pg = self.schedules[['week', 'year']].drop_duplicates().merge(pg, on=['week', 'year'], how='left')
+			# pg = self.schedules[['week', 'year']].drop_duplicates().merge(pg, on=['week', 'year'], how='left')
 			
 			# For training: use actual snap counts
 			if 'off_pct' in pg.columns:
